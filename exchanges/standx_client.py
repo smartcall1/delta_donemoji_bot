@@ -109,7 +109,9 @@ class StandXClient:
 
     async def get_positions(self) -> list:
         resp = await self._request("GET", "/api/query_positions")
-        return resp.get("data", [])
+        raw = resp.get("data", [])
+        # qty=0인 빈 포지션 껍데기 필터링 (StandX가 레버리지 설정 시 자동 생성)
+        return [p for p in raw if float(p.get("qty", 0)) != 0]
 
     async def place_limit_order(self, symbol: str, side: str, price: float, quantity: float) -> dict:
         body = {
