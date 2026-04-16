@@ -89,6 +89,10 @@ class TelegramUI:
                     # 텍스트 메시지로 버튼 입력 감지
                     msg = update.get("message")
                     if msg and msg.get("text"):
+                        # N-3: 등록된 chat_id만 허용
+                        msg_chat = str(msg.get("chat", {}).get("id", ""))
+                        if msg_chat != self.chat_id:
+                            continue
                         text = msg["text"].strip()
                         handler = self._callbacks.get(text)
                         if handler:

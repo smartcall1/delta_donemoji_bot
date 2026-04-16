@@ -12,7 +12,7 @@ StandX × Hibachi 델타 뉴트럴 ETH 양빵봇.
 cp .env.example .env   # API 키 입력
 pip install -r requirements.txt
 python test_connection.py   # 연결 확인
-python run_bot.py           # 봇 시작
+python run_delta.py           # 봇 시작
 ```
 
 ## 텔레그램 버튼

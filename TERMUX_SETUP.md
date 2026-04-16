@@ -65,7 +65,7 @@ python test_connection.py
 ```bash
 # 백그라운드 실행
 termux-wake-lock
-nohup python -u run_bot.py > bot.log 2>&1 &
+nohup python -u run_delta.py > bot.log 2>&1 &
 echo $! > bot.pid
 
 # 로그 확인
@@ -80,7 +80,7 @@ tail -f bot.log
 kill $(cat bot.pid)
 
 # 재시작
-nohup python -u run_bot.py > bot.log 2>&1 &
+nohup python -u run_delta.py > bot.log 2>&1 &
 echo $! > bot.pid
 
 # 상태 확인
@@ -97,7 +97,7 @@ cat > ~/.termux/boot/start_bot.sh << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 termux-wake-lock
 cd ~/delta_donemoji_bot
-nohup python -u run_bot.py > bot.log 2>&1 &
+nohup python -u run_delta.py > bot.log 2>&1 &
 echo $! > bot.pid
 EOF
 chmod +x ~/.termux/boot/start_bot.sh
