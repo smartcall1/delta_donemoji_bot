@@ -157,12 +157,22 @@ class DeltaNeutralBot:
             sx_quantity = notional / sx_price
             hb_quantity = notional / hb_price
 
+            # NEW-1: 진입 슬리피지 0.2% 적용 (체결률 향상)
+            if standx_side == "BUY":
+                sx_order_price = round(sx_price * 1.002, 2)
+            else:
+                sx_order_price = round(sx_price * 0.998, 2)
+            if hibachi_side == "BUY":
+                hb_order_price = round(hb_price * 1.002, 2)
+            else:
+                hb_order_price = round(hb_price * 0.998, 2)
+
             try:
                 await self.standx.place_limit_order(
-                    Config.PAIR_STANDX, standx_side, sx_price, round(sx_quantity, 4)
+                    Config.PAIR_STANDX, standx_side, sx_order_price, round(sx_quantity, 4)
                 )
                 await self.hibachi.place_limit_order(
-                    Config.PAIR_HIBACHI, hibachi_side, hb_price, round(hb_quantity, 6)
+                    Config.PAIR_HIBACHI, hibachi_side, hb_order_price, round(hb_quantity, 6)
                 )
             except Exception as e:
                 logger.error("주문 제출 실패 (시도 %d/%d): %s", attempt + 1, ENTRY_MAX_RETRIES, e)
@@ -192,6 +202,18 @@ class DeltaNeutralBot:
                     leverage=Config.LEVERAGE, margin=margin,
                 )
                 return True
+
+            # NEW-3: 미체결 주문 취소 (유령 주문 방지)
+            if not has_standx:
+                try:
+                    await self.standx.cancel_order("all")
+                except Exception:
+                    pass
+            if not has_hibachi:
+                try:
+                    await self.hibachi.cancel_order("all")
+                except Exception:
+                    pass
 
             # C1: 편측 체결 — 공격적 슬리피지로 해제 + 검증
             if has_standx and not has_hibachi:
@@ -231,7 +253,7 @@ class DeltaNeutralBot:
         return False
 
     async def _execute_exit(self) -> bool:
-        """양쪽 동시 청산 — C2: 실패한 쪽은 positions에 유지"""
+        """양쪽 동시 청산 — C2: 실패한 쪽 유지 + NEW-4: 청산 검증"""
         failed = []
         succeeded = []
 
@@ -254,7 +276,24 @@ class DeltaNeutralBot:
                 await self.telegram.send_alert(f"🚨 {key} 청산 실패: {e}\n수동 확인 필요!")
                 failed.append(key)
 
-        # C2: 성공한 것만 제거
+        # NEW-4: 청산 검증 — 실제로 닫혔는지 확인
+        if succeeded:
+            await asyncio.sleep(5)
+            sx_positions = await self.standx.get_positions()
+            hb_positions = await self.hibachi.get_positions()
+            sx_still = any(p.get("symbol") == Config.PAIR_STANDX for p in sx_positions)
+            hb_still = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hb_positions)
+
+            if "standx" in succeeded and sx_still:
+                logger.error("StandX 청산 주문 제출됐으나 포지션 여전히 존재")
+                succeeded.remove("standx")
+                failed.append("standx")
+            if "hibachi" in succeeded and hb_still:
+                logger.error("Hibachi 청산 주문 제출됐으나 포지션 여전히 존재")
+                succeeded.remove("hibachi")
+                failed.append("hibachi")
+
+        # C2: 확인된 것만 제거
         for key in succeeded:
             del self._positions[key]
 
@@ -550,7 +589,9 @@ class DeltaNeutralBot:
                 f"⚠️ 봇 재시작: {side}에만 포지션 존재! 수동 확인 필요"
             )
         else:
+            # NEW-5: ENTER/ANALYZE 상태에서 크래시 후 포지션 없음 → IDLE 복귀
             if self.state.cycle_state not in (CycleState.IDLE, CycleState.COOLDOWN):
+                logger.info("포지션 없음 + 비정상 상태(%s) → IDLE 복귀", self.state.cycle_state)
                 self.state.cycle_state = CycleState.IDLE
 
         self._save_state()
