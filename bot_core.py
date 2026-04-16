@@ -109,6 +109,14 @@ class DeltaNeutralBot:
     def _on_hibachi_price(self, price: float):
         self.hibachi_price = price
 
+    @staticmethod
+    def _parse_sx_balance(bal: dict) -> float:
+        """StandX 잔액 파싱 — 응답 키 호환"""
+        for key in ("available_balance", "cross_available", "balance", "equity"):
+            if key in bal:
+                return float(bal[key])
+        return 0.0
+
     def _parse_direction(self, direction: str) -> tuple[str, str]:
         standx_side = "BUY" if "standx_long" in direction else "SELL"
         hibachi_side = "SELL" if "hibachi_short" in direction else "BUY"
@@ -414,7 +422,7 @@ class DeltaNeutralBot:
 
                 sx_bal = await self.standx.get_balance()
                 hb_bal = await self.hibachi.get_balance()
-                sx_available = float(sx_bal.get("available_balance", 0))
+                sx_available = self._parse_sx_balance(sx_bal)
                 hb_available = float(hb_bal.get("available", 0))
 
                 self.state.standx_balance = sx_available
@@ -517,7 +525,7 @@ class DeltaNeutralBot:
                 self._current_cycle.exited_at = time.time()
                 sx_bal = await self.standx.get_balance()
                 hb_bal = await self.hibachi.get_balance()
-                self._current_cycle.standx_balance_after = float(sx_bal.get("available_balance", 0))
+                self._current_cycle.standx_balance_after = self._parse_sx_balance(sx_bal)
                 self._current_cycle.hibachi_balance_after = float(hb_bal.get("available", 0))
                 self.state.standx_balance = self._current_cycle.standx_balance_after
                 self.state.hibachi_balance = self._current_cycle.hibachi_balance_after
@@ -754,7 +762,7 @@ class DeltaNeutralBot:
                     try:
                         sx_bal = await self.standx.get_balance()
                         hb_bal = await self.hibachi.get_balance()
-                        self.state.standx_balance = float(sx_bal.get("available_balance", 0))
+                        self.state.standx_balance = self._parse_sx_balance(sx_bal)
                         self.state.hibachi_balance = float(hb_bal.get("available", 0))
                         self._consecutive_api_failures = 0
                         self._save_state()

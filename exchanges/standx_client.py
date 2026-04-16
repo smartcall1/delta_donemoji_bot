@@ -1,6 +1,7 @@
 """StandX Perps REST + WebSocket 클라이언트"""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import asyncio
@@ -19,7 +20,15 @@ class StandXClient:
     def __init__(self, base_url: str, jwt_token: str, private_key_hex: str):
         self.base_url = base_url.rstrip("/")
         self.jwt_token = jwt_token
-        self._signing_key = SigningKey(bytes.fromhex(private_key_hex))
+        # 키 포맷 자동 감지: hex(64자) 또는 base64
+        try:
+            key_bytes = bytes.fromhex(private_key_hex)
+        except ValueError:
+            key_bytes = base64.b64decode(private_key_hex)
+        # Ed25519 seed는 32바이트, 프리픽스가 있으면 마지막 32바이트 사용
+        if len(key_bytes) > 32:
+            key_bytes = key_bytes[-32:]
+        self._signing_key = SigningKey(key_bytes)
         self._session: aiohttp.ClientSession | None = None
 
     async def _ensure_session(self):
@@ -46,9 +55,12 @@ class StandXClient:
                 url = f"{self.base_url}{path}"
                 async with self._session.request(method, url, params=params) as resp:
                     data = await resp.json()
-                    if resp.status != 200 or data.get("code") != 0:
-                        logger.error("StandX API error: %s %s → %s", method, path, data)
-                    return data
+                    if resp.status != 200:
+                        logger.error("StandX API error: %s %s → %d %s", method, path, resp.status, data)
+                    # 응답이 {"code":0,"data":...} 형식이면 감싸고, 아니면 그대로 반환
+                    if isinstance(data, dict) and "code" in data:
+                        return data
+                    return {"code": 0, "data": data}
             except Exception as e:
                 last_err = e
                 logger.warning("StandX API 재시도 %d/%d: %s %s → %s", attempt + 1, MAX_RETRIES, method, path, e)
@@ -67,9 +79,11 @@ class StandXClient:
                 headers = {"x-request-signature": signature, "Content-Type": "application/json"}
                 async with self._session.request(method, url, data=body_str, headers=headers) as resp:
                     data = await resp.json()
-                    if resp.status != 200 or data.get("code") != 0:
-                        logger.error("StandX signed API error: %s %s → %s", method, path, data)
-                    return data
+                    if resp.status != 200:
+                        logger.error("StandX signed API error: %s %s → %d %s", method, path, resp.status, data)
+                    if isinstance(data, dict) and "code" in data:
+                        return data
+                    return {"code": 0, "data": data}
             except Exception as e:
                 last_err = e
                 logger.warning("StandX signed API 재시도 %d/%d: %s", attempt + 1, MAX_RETRIES, e)

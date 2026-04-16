@@ -29,7 +29,7 @@ async def _retry(fn, *args, **kwargs):
             return await fn(*args, **kwargs)
         except Exception as e:
             last_err = e
-            logger.warning("Hibachi API 재시도 %d/%d: %s", attempt + 1, MAX_RETRIES, e)
+            logger.warning("Hibachi API retry %d/%d: %s", attempt + 1, MAX_RETRIES, e)
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY * (attempt + 1))
     raise last_err
@@ -43,68 +43,114 @@ class HibachiClient:
 
     def _ensure_sdk(self):
         if not self._initialized:
-            from hibachi.rest import HibachiRestClient
-            self._rest = HibachiRestClient()
+            from hibachi_xyz import HibachiApiClient
+            self._rest = HibachiApiClient()
+            # SDK에 명시적으로 credentials 설정
+            self._rest.set_api_key(os.environ.get("HIBACHI_API_KEY_PRODUCTION", ""))
+            self._rest.set_private_key(os.environ.get("HIBACHI_PRIVATE_KEY_PRODUCTION", ""))
+            self._rest.set_account_id(os.environ.get("HIBACHI_ACCOUNT_ID_PRODUCTION", ""))
             self._initialized = True
 
-    async def _get_balance_raw(self) -> dict:
+    # --- 내부 raw 호출 (SDK 객체 반환) ---
+
+    async def _get_balance_raw(self):
         self._ensure_sdk()
         return await asyncio.to_thread(self._rest.get_capital_balance)
 
-    async def _get_positions_raw(self) -> list:
+    async def _get_account_info_raw(self):
         self._ensure_sdk()
-        info = await asyncio.to_thread(self._rest.get_account_info)
-        return info.get("positions", [])
+        return await asyncio.to_thread(self._rest.get_account_info)
 
-    async def _get_prices_raw(self, symbol: str) -> dict:
+    async def _get_prices_raw(self, symbol: str):
         self._ensure_sdk()
         return await asyncio.to_thread(self._rest.get_prices, symbol)
 
-    async def _get_stats_raw(self, symbol: str) -> dict:
+    async def _get_stats_raw(self, symbol: str):
         self._ensure_sdk()
         return await asyncio.to_thread(self._rest.get_stats, symbol)
 
-    async def _place_order_raw(self, **kwargs) -> dict:
+    async def _place_order_raw(self, **kwargs):
         self._ensure_sdk()
         return await asyncio.to_thread(self._rest.place_limit_order, **kwargs)
 
-    async def _cancel_order_raw(self, order_id: str) -> dict:
+    async def _cancel_order_raw(self, order_id: str):
         self._ensure_sdk()
         return await asyncio.to_thread(self._rest.cancel_order, order_id=order_id)
 
+    # --- 공개 인터페이스 (dict/float 반환) ---
+
     async def get_balance(self) -> dict:
-        return await _retry(self._get_balance_raw)
+        result = await _retry(self._get_balance_raw)
+        # SDK dataclass → dict 변환
+        if hasattr(result, "__dataclass_fields__"):
+            from dataclasses import asdict
+            return asdict(result)
+        if isinstance(result, dict):
+            return result
+        return {"raw": str(result)}
 
     async def get_positions(self) -> list:
-        return await _retry(self._get_positions_raw)
+        result = await _retry(self._get_account_info_raw)
+        positions = []
+        raw_positions = getattr(result, "positions", []) if hasattr(result, "positions") else []
+        for p in raw_positions:
+            if hasattr(p, "__dataclass_fields__"):
+                from dataclasses import asdict
+                positions.append(asdict(p))
+            elif isinstance(p, dict):
+                positions.append(p)
+        return positions
 
     async def get_mark_price(self, symbol: str) -> float:
-        data = await _retry(self._get_prices_raw, symbol)
-        return float(data.get("mark_price", 0))
+        result = await _retry(self._get_prices_raw, symbol)
+        # SDK PriceResponse: markPrice 속성
+        if hasattr(result, "markPrice"):
+            return float(result.markPrice)
+        if isinstance(result, dict):
+            return float(result.get("markPrice", result.get("mark_price", 0)))
+        return 0.0
 
     async def get_funding_rate(self, symbol: str) -> float:
-        data = await _retry(self._get_stats_raw, symbol)
-        return float(data.get("funding_rate", 0))
+        result = await _retry(self._get_stats_raw, symbol)
+        # SDK StatsResponse: fundingRate 속성
+        if hasattr(result, "fundingRate"):
+            return float(result.fundingRate)
+        # PriceResponse의 fundingRateEstimation 내부
+        if hasattr(result, "fundingRateEstimation"):
+            est = result.fundingRateEstimation
+            if hasattr(est, "estimatedFundingRate"):
+                return float(est.estimatedFundingRate)
+        if isinstance(result, dict):
+            return float(result.get("fundingRate", result.get("funding_rate", 0)))
+        return 0.0
 
     async def place_limit_order(self, symbol: str, side: str, price: float, size: float,
-                               post_only: bool = False) -> dict:
-        """RC-2: post_only 기본값 False. 진입/청산 시 체결 우선."""
-        return await _retry(
+                                post_only: bool = False) -> dict:
+        result = await _retry(
             self._place_order_raw,
             symbol=symbol, side=side, price=price, size=size, post_only=post_only,
         )
+        if hasattr(result, "__dataclass_fields__"):
+            from dataclasses import asdict
+            return asdict(result)
+        if isinstance(result, dict):
+            return result
+        return {"raw": str(result)}
 
     async def cancel_order(self, order_id: str) -> dict:
-        return await _retry(self._cancel_order_raw, order_id)
+        result = await _retry(self._cancel_order_raw, order_id)
+        if hasattr(result, "__dataclass_fields__"):
+            from dataclasses import asdict
+            return asdict(result)
+        return {"raw": str(result)}
 
     async def cancel_all_orders(self) -> dict:
-        """RI-7: 전체 미체결 주문 취소"""
         self._ensure_sdk()
-        return await asyncio.to_thread(self._rest.cancel_all_orders)
+        result = await asyncio.to_thread(self._rest.cancel_all_orders)
+        return {"raw": str(result)}
 
     async def close_position(self, symbol: str, side: str, size: float,
                              slippage_pct: float = 0.005) -> dict:
-        """포지션 청산. slippage_pct: 기본 0.5% (I2: 0.1%→0.5% 확대)"""
         close_side = "SELL" if side == "BUY" else "BUY"
         price = await self.get_mark_price(symbol)
         if close_side == "BUY":
@@ -123,24 +169,26 @@ class HibachiWSClient:
         self.symbol = symbol
         self.on_price = on_price
         self._running = False
-        self._ws_instance = None  # NEW-6: 인스턴스 저장
+        self._ws_instance = None
 
     async def connect(self):
         self._running = True
         retry_delay = 1
         while self._running:
             try:
-                from hibachi.ws import HibachiWSMarketClient
+                from hibachi_xyz import HibachiWSMarketClient
                 ws = HibachiWSMarketClient()
-                self._ws_instance = ws  # NEW-6: 외부 중단용
+                self._ws_instance = ws
 
                 def _on_mark_price(data):
                     try:
-                        if data.get("symbol") == self.symbol:
-                            mark = float(data.get("mark_price", 0))
+                        sym = getattr(data, "symbol", None) or (data.get("symbol") if isinstance(data, dict) else None)
+                        if sym == self.symbol:
+                            mark = float(getattr(data, "markPrice", None) or
+                                         (data.get("markPrice", data.get("mark_price", 0)) if isinstance(data, dict) else 0))
                             if mark > 0:
                                 self.on_price(mark)
-                    except (ValueError, KeyError):
+                    except (ValueError, KeyError, TypeError):
                         pass
 
                 ws.on("mark_price", _on_mark_price)
@@ -157,7 +205,6 @@ class HibachiWSClient:
 
     async def disconnect(self):
         self._running = False
-        # NEW-6: 블로킹 ws.start() 중단 시도
         if self._ws_instance is not None:
             try:
                 if hasattr(self._ws_instance, "stop"):
