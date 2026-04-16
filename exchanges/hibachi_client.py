@@ -86,14 +86,28 @@ class HibachiClient:
         self._ensure_sdk()
         return await asyncio.to_thread(self._rest.cancel_order, order_id=order_id)
 
+    @staticmethod
+    def _to_dict(obj) -> dict:
+        """SDK dataclass/tuple/dict → dict 안전 변환"""
+        if isinstance(obj, dict):
+            return obj
+        if hasattr(obj, "__dataclass_fields__"):
+            try:
+                from dataclasses import asdict
+                return asdict(obj)
+            except TypeError:
+                pass
+        if hasattr(obj, "__dict__"):
+            return obj.__dict__
+        return {"raw": str(obj)}
+
     # --- 공개 인터페이스 (dict/float 반환) ---
 
     async def get_balance(self) -> dict:
         result = await _retry(self._get_balance_raw)
         # SDK dataclass → dict 변환
-        if hasattr(result, "__dataclass_fields__"):
-            from dataclasses import asdict
-            return asdict(result)
+        if not isinstance(result, dict):
+            return self._to_dict(result)
         if isinstance(result, dict):
             return result
         return {"raw": str(result)}
@@ -103,11 +117,7 @@ class HibachiClient:
         positions = []
         raw_positions = getattr(result, "positions", []) if hasattr(result, "positions") else []
         for p in raw_positions:
-            if hasattr(p, "__dataclass_fields__"):
-                from dataclasses import asdict
-                positions.append(asdict(p))
-            elif isinstance(p, dict):
-                positions.append(p)
+            positions.append(self._to_dict(p) if not isinstance(p, dict) else p)
         return positions
 
     async def get_mark_price(self, symbol: str) -> float:
@@ -139,18 +149,16 @@ class HibachiClient:
             self._place_order_raw,
             symbol=symbol, side=side, price=price, quantity=size, post_only=post_only,
         )
-        if hasattr(result, "__dataclass_fields__"):
-            from dataclasses import asdict
-            return asdict(result)
+        if not isinstance(result, dict):
+            return self._to_dict(result)
         if isinstance(result, dict):
             return result
         return {"raw": str(result)}
 
     async def cancel_order(self, order_id: str) -> dict:
         result = await _retry(self._cancel_order_raw, order_id)
-        if hasattr(result, "__dataclass_fields__"):
-            from dataclasses import asdict
-            return asdict(result)
+        if not isinstance(result, dict):
+            return self._to_dict(result)
         return {"raw": str(result)}
 
     async def cancel_all_orders(self) -> dict:

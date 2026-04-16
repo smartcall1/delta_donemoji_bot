@@ -706,11 +706,12 @@ class DeltaNeutralBot:
             if self._positions:
                 await self._execute_exit()
 
-        self.telegram.register_callback("status", on_status)
-        self.telegram.register_callback("history", on_history)
-        self.telegram.register_callback("funding", on_funding)
-        self.telegram.register_callback("rebalance", on_rebalance)
-        self.telegram.register_callback("stop", on_stop)
+        from telegram_ui import BTN_STATUS, BTN_HISTORY, BTN_FUNDING, BTN_REBALANCE, BTN_STOP
+        self.telegram.register_callback(BTN_STATUS, on_status)
+        self.telegram.register_callback(BTN_HISTORY, on_history)
+        self.telegram.register_callback(BTN_FUNDING, on_funding)
+        self.telegram.register_callback(BTN_REBALANCE, on_rebalance)
+        self.telegram.register_callback(BTN_STOP, on_stop)
 
     async def run(self):
         self._running = True

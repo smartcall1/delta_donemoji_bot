@@ -1,4 +1,4 @@
-"""텔레그램 알림 + 버튼 UI (폴링 방식)"""
+"""텔레그램 알림 + 전역 키보드 UI (폴링 방식)"""
 from __future__ import annotations
 
 import json
@@ -9,6 +9,22 @@ from typing import Callable
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# 전역 하단 고정 버튼 텍스트
+BTN_STATUS = "📊 Status"
+BTN_HISTORY = "📋 History"
+BTN_FUNDING = "💰 Funding"
+BTN_REBALANCE = "🔄 Rebalance"
+BTN_STOP = "⏹ Stop"
+
+KEYBOARD = {
+    "keyboard": [
+        [BTN_STATUS, BTN_HISTORY, BTN_FUNDING],
+        [BTN_REBALANCE, BTN_STOP],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
 
 
 class TelegramUI:
@@ -32,15 +48,16 @@ class TelegramUI:
             await self._session.close()
 
     def register_callback(self, key: str, handler: Callable):
+        """버튼 텍스트 → 핸들러 등록"""
         self._callbacks[key] = handler
 
-    async def send_message(self, text: str, buttons: list[list[dict]] | None = None) -> int | None:
+    async def send_message(self, text: str, with_keyboard: bool = True) -> int | None:
         if not self.enabled:
             return None
         await self._ensure_session()
         payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
-        if buttons:
-            payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+        if with_keyboard:
+            payload["reply_markup"] = json.dumps(KEYBOARD)
         try:
             async with self._session.post(f"{self.base}/sendMessage", json=payload) as resp:
                 data = await resp.json()
@@ -55,28 +72,7 @@ class TelegramUI:
         await self.send_message(text)
 
     async def send_main_menu(self, status_text: str):
-        buttons = [
-            [
-                {"text": "📊 Status", "callback_data": "status"},
-                {"text": "📋 History", "callback_data": "history"},
-                {"text": "💰 Funding", "callback_data": "funding"},
-            ],
-            [
-                {"text": "🔄 Rebalance", "callback_data": "rebalance"},
-                {"text": "⏹ Stop", "callback_data": "stop"},
-            ],
-        ]
-        await self.send_message(status_text, buttons)
-
-    async def answer_callback(self, callback_id: str, text: str = ""):
-        if not self.enabled:
-            return
-        await self._ensure_session()
-        payload = {"callback_query_id": callback_id, "text": text}
-        try:
-            await self._session.post(f"{self.base}/answerCallbackQuery", json=payload)
-        except Exception:
-            pass
+        await self.send_message(status_text)
 
     async def poll_updates(self):
         if not self.enabled:
@@ -90,13 +86,13 @@ class TelegramUI:
                     return
                 for update in data.get("result", []):
                     self._offset = update["update_id"] + 1
-                    cb = update.get("callback_query")
-                    if cb:
-                        key = cb.get("data", "")
-                        handler = self._callbacks.get(key)
+                    # 텍스트 메시지로 버튼 입력 감지
+                    msg = update.get("message")
+                    if msg and msg.get("text"):
+                        text = msg["text"].strip()
+                        handler = self._callbacks.get(text)
                         if handler:
-                            await handler(cb)
-                        await self.answer_callback(cb["id"])
+                            await handler(msg)
         except asyncio.TimeoutError:
             pass
         except Exception as e:

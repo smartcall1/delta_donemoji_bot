@@ -23,7 +23,7 @@ async def test_get_balance(client):
 @pytest.mark.asyncio
 async def test_get_positions(client):
     mock_resp = {"code": 0, "data": [
-        {"symbol": "ETH-USD", "side": "LONG", "position_size": "10.0", "entry_price": "1800.0"}
+        {"symbol": "ETH-USD", "side": "LONG", "qty": "10.0", "entry_price": "1800.0"}
     ]}
     with patch.object(client, "_request", new_callable=AsyncMock, return_value=mock_resp):
         positions = await client.get_positions()
