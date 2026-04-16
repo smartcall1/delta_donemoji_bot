@@ -219,17 +219,28 @@ monitor.py → exchanges/standx_client.py, exchanges/hibachi_client.py
 
 ---
 
-## 8. 통신 방식 — REST 폴링 (WebSocket 없음)
+## 8. 통신 방식 — WebSocket + REST 하이브리드
 
-Termux 경량화를 위해 WebSocket 상시 연결 없이 REST 폴링만 사용.
+### WebSocket (상시 연결 — 안전 최우선)
+
+| 연결 | 스트림 | 목적 |
+|---|---|---|
+| StandX WS | price (ETH-USD) | 실시간 가격 → 마진율 계산 → 즉시 청산 판단 |
+| Hibachi WS | MARK_PRICE (ETH/USDT-P) | 실시간 가격 → 마진율 계산 → 즉시 청산 판단 |
+
+- 가격 감지 지연: ~100ms (REST 1분 폴링 대비 600배 빠름)
+- WS 끊김 시: 자동 재연결 (지수 백오프), 재연결 실패 시 REST fallback
+- Hibachi SDK: `HibachiWSMarketClient` 사용 (인증 불필요)
+- StandX: `wss://perps.standx.com/ws-stream/v1` price 채널 구독
+
+### REST (보조 — 주기적 검증)
 
 | 주기 | 대상 | 목적 |
 |---|---|---|
-| 매 1분 | 양쪽 마진율 + 현재가 | 청산 방어 (안전 최우선) |
-| 매 5분 | 양쪽 잔액, 포지션 상세 | 상태 추적 |
+| 매 5분 | 양쪽 잔액, 포지션 상세 | 상태 추적, WS 데이터 검증 |
 | 매 1시간 | 양쪽 펀딩레이트 | 누적비용 갱신, 전환 판단 |
 
-**예상 메모리**: ~20-30MB (WebSocket 사용 시 ~80-150MB 대비).
+**예상 메모리**: ~25-35MB (WS 2개 추가 = +5-10MB 수준).
 
 ---
 
