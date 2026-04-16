@@ -87,6 +87,7 @@ class BotState:
     cooldown_until: float = 0.0
     initial_standx_balance: float = 0.0
     initial_hibachi_balance: float = 0.0
+    cumulative_funding_cost: float = 0.0  # RM-6: 펀딩비용 누적 (크래시 복구용)
 
     def to_dict(self) -> dict:
         d = asdict(self)

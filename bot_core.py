@@ -77,7 +77,7 @@ class DeltaNeutralBot:
         self._current_cycle: Cycle | None = None
         self._cycle_entered_at: float | None = self.state.cycle_entered_at or None
         self._cooldown_until: float | None = self.state.cooldown_until or None
-        self._cumulative_funding_cost: float = 0.0
+        self._cumulative_funding_cost: float = self.state.cumulative_funding_cost
         self._initial_standx_balance: float = self.state.initial_standx_balance
         self._initial_hibachi_balance: float = self.state.initial_hibachi_balance
         self._running = False
@@ -95,11 +95,12 @@ class DeltaNeutralBot:
         return BotState()
 
     def _save_state(self):
-        # I6+I7: 휘발성 상태도 저장
+        # I6+I7+RM-6: 휘발성 상태도 저장
         if self._cycle_entered_at:
             self.state.cycle_entered_at = self._cycle_entered_at
         if self._cooldown_until:
             self.state.cooldown_until = self._cooldown_until
+        self.state.cumulative_funding_cost = self._cumulative_funding_cost
         self.state.save(os.path.join(Config.LOG_DIR, "bot_state.json"))
 
     def _on_standx_price(self, price: float):
@@ -169,13 +170,19 @@ class DeltaNeutralBot:
             else:
                 hb_order_price = round(hb_price * 0.998, 2)
 
+            # RC-3: 주문 응답 검증 — 거부 시 즉시 재시도
             try:
-                await self.standx.place_limit_order(
+                sx_resp = await self.standx.place_limit_order(
                     Config.PAIR_STANDX, standx_side, sx_order_price, round(sx_quantity, 4)
                 )
-                await self.hibachi.place_limit_order(
+                hb_resp = await self.hibachi.place_limit_order(
                     Config.PAIR_HIBACHI, hibachi_side, hb_order_price, round(hb_quantity, 6)
                 )
+                # 응답에 에러 코드가 있으면 체결 불가
+                if not sx_resp or not hb_resp:
+                    logger.warning("주문 응답 비어있음 (시도 %d/%d)", attempt + 1, ENTRY_MAX_RETRIES)
+                    await asyncio.sleep(5)
+                    continue
             except Exception as e:
                 logger.error("주문 제출 실패 (시도 %d/%d): %s", attempt + 1, ENTRY_MAX_RETRIES, e)
                 await self.telegram.send_alert(f"⚠️ 주문 제출 실패 (시도 {attempt + 1}/{ENTRY_MAX_RETRIES}): {e}")
@@ -205,15 +212,15 @@ class DeltaNeutralBot:
                 )
                 return True
 
-            # NEW-3: 미체결 주문 취소 (유령 주문 방지)
+            # NEW-3+RI-7: 미체결 주문 취소 (유령 주문 방지)
             if not has_standx:
                 try:
-                    await self.standx.cancel_order("all")
+                    await self.standx.cancel_all_orders(Config.PAIR_STANDX)
                 except Exception:
                     pass
             if not has_hibachi:
                 try:
-                    await self.hibachi.cancel_order("all")
+                    await self.hibachi.cancel_all_orders()
                 except Exception:
                     pass
 
@@ -255,13 +262,28 @@ class DeltaNeutralBot:
         return False
 
     async def _execute_exit(self) -> bool:
-        """양쪽 동시 청산 — C2: 실패한 쪽 유지 + NEW-4: 청산 검증"""
+        """양쪽 동시 청산 — RC-5: 실제 포지션 수량 + NEW-4: 청산 검증"""
         failed = []
         succeeded = []
 
+        # RC-5: 실제 포지션 크기를 거래소에서 조회
+        actual_sizes = {}
+        try:
+            sx_positions = await self.standx.get_positions()
+            for p in sx_positions:
+                if p.get("symbol") == Config.PAIR_STANDX:
+                    actual_sizes["standx"] = abs(float(p.get("position_size", p.get("size", 0))))
+            hb_positions = await self.hibachi.get_positions()
+            for p in hb_positions:
+                if p.get("symbol") == Config.PAIR_HIBACHI:
+                    actual_sizes["hibachi"] = abs(float(p.get("size", p.get("position_size", 0))))
+        except Exception as e:
+            logger.warning("청산 전 포지션 조회 실패, 저장값 사용: %s", e)
+
         for key, pos in list(self._positions.items()):
             try:
-                quantity = pos.notional / pos.entry_price
+                # RC-5: 실제 수량 우선, 없으면 계산값 사용
+                quantity = actual_sizes.get(key, pos.notional / pos.entry_price)
                 if pos.exchange == "standx":
                     side = "BUY" if pos.side == "LONG" else "SELL"
                     await self.standx.close_position(
@@ -676,6 +698,13 @@ class DeltaNeutralBot:
             f"🚀 Delta Neutral Bot 시작\n상태: {self.state.cycle_state}"
         )
 
+        # RM-3: 시작 시 레버리지 설정
+        try:
+            await self.standx.change_leverage(Config.PAIR_STANDX, Config.LEVERAGE)
+            logger.info("StandX 레버리지 %dx 설정 완료", Config.LEVERAGE)
+        except Exception as e:
+            logger.warning("StandX 레버리지 설정 실패 (수동 확인 필요): %s", e)
+
         await self._recovery_check()
 
         ws_tasks = [
@@ -739,9 +768,20 @@ class DeltaNeutralBot:
                                 f"🚨 API {self._consecutive_api_failures}회 연속 실패! "
                                 f"포지션 감시 불가 — 긴급 청산 실행!"
                             )
-                            await self._execute_exit()
-                            self.state.cycle_state = CycleState.COOLDOWN
-                            self._cooldown_until = now + Config.COOLDOWN_HOURS * 3600
+                            exit_ok = await self._execute_exit()
+                            # RC-4: 긴급 청산 후 상태 정리
+                            self._current_cycle = None
+                            self._cycle_entered_at = None
+                            self.state.cycle_entered_at = 0.0
+                            self.state.current_direction = ""
+                            self._cumulative_funding_cost = 0.0
+                            if exit_ok:
+                                self.state.cycle_state = CycleState.COOLDOWN
+                                self._cooldown_until = now + Config.COOLDOWN_HOURS * 3600
+                            else:
+                                # 부분 실패 시 EXIT 상태로 재시도 유도
+                                self.state.cycle_state = CycleState.EXIT
+                                await self.telegram.send_alert("🚨 긴급 청산 부분 실패! EXIT 상태에서 재시도합니다")
                             self._save_state()
 
                 # 펀딩레이트 체크 (1시간) + I1: 누적 비용 갱신

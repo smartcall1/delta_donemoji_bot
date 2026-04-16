@@ -86,14 +86,21 @@ class HibachiClient:
         data = await _retry(self._get_stats_raw, symbol)
         return float(data.get("funding_rate", 0))
 
-    async def place_limit_order(self, symbol: str, side: str, price: float, size: float) -> dict:
+    async def place_limit_order(self, symbol: str, side: str, price: float, size: float,
+                               post_only: bool = False) -> dict:
+        """RC-2: post_only 기본값 False. 진입/청산 시 체결 우선."""
         return await _retry(
             self._place_order_raw,
-            symbol=symbol, side=side, price=price, size=size, post_only=True,
+            symbol=symbol, side=side, price=price, size=size, post_only=post_only,
         )
 
     async def cancel_order(self, order_id: str) -> dict:
         return await _retry(self._cancel_order_raw, order_id)
+
+    async def cancel_all_orders(self) -> dict:
+        """RI-7: 전체 미체결 주문 취소"""
+        self._ensure_sdk()
+        return await asyncio.to_thread(self._rest.cancel_all_orders)
 
     async def close_position(self, symbol: str, side: str, size: float,
                              slippage_pct: float = 0.005) -> dict:

@@ -54,6 +54,7 @@ async def test_place_limit_order_post_only(client):
             symbol="ETH/USDT-P", side="SELL", price=1850.0, size=10.0
         )
         assert result["order_id"] == "hib123"
+        # RC-2: post_only 기본값 False (체결 우선)
         client._place_order_raw.assert_called_once_with(
-            symbol="ETH/USDT-P", side="SELL", price=1850.0, size=10.0, post_only=True,
+            symbol="ETH/USDT-P", side="SELL", price=1850.0, size=10.0, post_only=False,
         )

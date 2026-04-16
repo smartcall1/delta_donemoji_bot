@@ -110,6 +110,12 @@ class StandXClient:
         resp = await self._signed_request("POST", "/api/cancel_order", body)
         return resp.get("data", {})
 
+    async def cancel_all_orders(self, symbol: str) -> dict:
+        """RI-7: 심볼 전체 미체결 주문 취소"""
+        body = {"symbol": symbol}
+        resp = await self._signed_request("POST", "/api/cancel_all_orders", body)
+        return resp.get("data", {})
+
     async def close_position(self, symbol: str, side: str, quantity: float,
                              slippage_pct: float = 0.005) -> dict:
         """포지션 청산. slippage_pct: 기본 0.5% (I2: 0.1%→0.5% 확대)"""
