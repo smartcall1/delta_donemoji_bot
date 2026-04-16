@@ -1,7 +1,35 @@
+# 환경변수 / 시크릿
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.pyc
-logs/
-.pytest_cache/
+*.pyo
 *.egg-info/
+dist/
+build/
 venv/
+.venv/
+
+# 런타임 로그
+logs/
+bot.log
+bot.pid
+.stop_bot
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 테스트
+.pytest_cache/
+htmlcov/
+.coverage
