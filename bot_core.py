@@ -30,7 +30,7 @@ from config import Config
 from models import CycleState, BotState, Position, Cycle, FundingSnapshot
 from exchanges.standx_client import StandXClient, StandXWSClient
 from exchanges.hibachi_client import HibachiClient, HibachiWSClient
-from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional
+from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional, is_opposite_direction_better
 from monitor import MarginLevel, check_margin_level, estimate_sip2_yield
 from telegram_ui import TelegramUI
 
@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 ENTRY_MAX_RETRIES = 3
+API_FAIL_EMERGENCY_THRESHOLD = 10  # S3: 연속 REST 실패 횟수 → 긴급 청산
 
 
 class DeltaNeutralBot:
@@ -82,6 +83,7 @@ class DeltaNeutralBot:
         self._running = False
         self._last_warning_time: float = 0.0
         self._last_daily_report: float = 0.0
+        self._consecutive_api_failures: int = 0  # S3: 연속 API 실패 추적
 
     def _load_state(self) -> BotState:
         path = os.path.join(Config.LOG_DIR, "bot_state.json")
@@ -717,7 +719,7 @@ class DeltaNeutralBot:
                 if self.state.cycle_state == CycleState.HOLD:
                     await self._check_dusd_depeg()
 
-                # 잔액 체크 (5분)
+                # 잔액 체크 (5분) + S3: 연속 실패 시 긴급 청산
                 if now - last_balance_check > Config.POLL_BALANCE_SECONDS:
                     last_balance_check = now
                     try:
@@ -725,9 +727,22 @@ class DeltaNeutralBot:
                         hb_bal = await self.hibachi.get_balance()
                         self.state.standx_balance = float(sx_bal.get("available_balance", 0))
                         self.state.hibachi_balance = float(hb_bal.get("available", 0))
+                        self._consecutive_api_failures = 0
                         self._save_state()
                     except Exception as e:
-                        logger.error("잔액 조회 실패: %s", e)
+                        self._consecutive_api_failures += 1
+                        logger.error("잔액 조회 실패 (%d연속): %s", self._consecutive_api_failures, e)
+                        if (self._consecutive_api_failures >= API_FAIL_EMERGENCY_THRESHOLD
+                                and self.state.cycle_state == CycleState.HOLD
+                                and self._positions):
+                            await self.telegram.send_alert(
+                                f"🚨 API {self._consecutive_api_failures}회 연속 실패! "
+                                f"포지션 감시 불가 — 긴급 청산 실행!"
+                            )
+                            await self._execute_exit()
+                            self.state.cycle_state = CycleState.COOLDOWN
+                            self._cooldown_until = now + Config.COOLDOWN_HOURS * 3600
+                            self._save_state()
 
                 # 펀딩레이트 체크 (1시간) + I1: 누적 비용 갱신
                 if now - last_funding_check > Config.POLL_FUNDING_SECONDS:
@@ -737,16 +752,38 @@ class DeltaNeutralBot:
                         sx_rate = float(sx_data.get("funding_rate", 0))
                         hb_rate = await self.hibachi.get_funding_rate(Config.PAIR_HIBACHI)
 
-                        # I1: HOLD 상태에서 펀딩비용 누적
+                        # I1+NEW-2: HOLD 상태 펀딩비용 누적 (노셔널 대비 비율)
                         if self.state.cycle_state == CycleState.HOLD and self._positions:
                             direction = self.state.current_direction
+                            sx_1h = sx_rate
+                            hb_1h = hb_rate / 8  # 8H→1H 정규화
+
+                            # 롱이 양수일 때 지불, 숏이 양수일 때 수취
                             if "standx_long" in direction:
-                                net_cost = sx_rate - (hb_rate / 8)
+                                # StandX Long: 양수면 비용 / Hibachi Short: 양수면 수익
+                                net_per_hour = sx_1h - hb_1h
                             else:
-                                net_cost = (hb_rate / 8) - sx_rate
-                            if net_cost > 0:
-                                self._cumulative_funding_cost += net_cost
-                            self.state.cumulative_funding += (sx_rate - (hb_rate / 8))
+                                net_per_hour = hb_1h - sx_1h
+
+                            # 누적: 양수=비용, 음수=수익 → 수익이면 차감
+                            self._cumulative_funding_cost += net_per_hour
+                            if self._cumulative_funding_cost < 0:
+                                self._cumulative_funding_cost = 0.0
+
+                            # 달러 기반 누적 (일일 리포트용)
+                            notional = self._current_cycle.notional if self._current_cycle else 30000.0
+                            self.state.cumulative_funding += -net_per_hour * notional
+
+                            # S5: 반대 방향이 현저히 유리하면 전환 트리거
+                            sx_8h = normalize_funding_to_8h(sx_rate, period_hours=1)
+                            hb_8h = normalize_funding_to_8h(hb_rate, period_hours=8)
+                            if is_opposite_direction_better(direction, sx_8h, hb_8h):
+                                hold_hours = (time.time() - self._cycle_entered_at) / 3600 if self._cycle_entered_at else 0
+                                if hold_hours >= Config.MIN_HOLD_HOURS:
+                                    logger.info("S5: 반대 방향 유리 → EXIT 트리거")
+                                    await self.telegram.send_alert("🔄 반대 방향이 유리해짐 → 전환 준비")
+                                    self.state.cycle_state = CycleState.EXIT
+                                    self._save_state()
 
                         path = os.path.join(Config.LOG_DIR, "funding_history.jsonl")
                         with open(path, "a") as f:

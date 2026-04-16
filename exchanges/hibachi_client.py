@@ -116,6 +116,7 @@ class HibachiWSClient:
         self.symbol = symbol
         self.on_price = on_price
         self._running = False
+        self._ws_instance = None  # NEW-6: 인스턴스 저장
 
     async def connect(self):
         self._running = True
@@ -124,6 +125,7 @@ class HibachiWSClient:
             try:
                 from hibachi.ws import HibachiWSMarketClient
                 ws = HibachiWSMarketClient()
+                self._ws_instance = ws  # NEW-6: 외부 중단용
 
                 def _on_mark_price(data):
                     try:
@@ -148,3 +150,13 @@ class HibachiWSClient:
 
     async def disconnect(self):
         self._running = False
+        # NEW-6: 블로킹 ws.start() 중단 시도
+        if self._ws_instance is not None:
+            try:
+                if hasattr(self._ws_instance, "stop"):
+                    self._ws_instance.stop()
+                elif hasattr(self._ws_instance, "close"):
+                    self._ws_instance.close()
+            except Exception:
+                pass
+            self._ws_instance = None

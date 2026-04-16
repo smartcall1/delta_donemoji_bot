@@ -40,6 +40,30 @@ def should_exit_cycle(
     return False
 
 
+def is_opposite_direction_better(
+    current_direction: str,
+    standx_rate_8h: float,
+    hibachi_rate_8h: float,
+    advantage_threshold: float = 0.0005,
+) -> bool:
+    """S5: 반대 방향이 현저히 유리한지 판단 (차이 > threshold)"""
+    option_a = hibachi_rate_8h - standx_rate_8h  # standx_long_hibachi_short
+    option_b = standx_rate_8h - hibachi_rate_8h  # standx_short_hibachi_long
+
+    if "standx_long" in current_direction:
+        current_net = option_a
+        opposite_net = option_b
+    else:
+        current_net = option_b
+        opposite_net = option_a
+
+    advantage = opposite_net - current_net
+    if advantage > advantage_threshold:
+        logger.info("반대 방향 유리: 현재=%.6f, 반대=%.6f, 차이=%.6f", current_net, opposite_net, advantage)
+        return True
+    return False
+
+
 def calc_notional(standx_balance: float, hibachi_balance: float, leverage: int,
                    margin_buffer: float = 0.95) -> float:
     """작은 쪽 잔액의 95%로 노셔널 계산 (M1: 펀딩비 여유분 확보)"""

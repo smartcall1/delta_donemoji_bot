@@ -1,5 +1,5 @@
 import pytest
-from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional
+from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional, is_opposite_direction_better
 
 
 class TestNormalizeFunding:
@@ -51,3 +51,23 @@ class TestCalcNotional:
 
     def test_custom_buffer(self):
         assert calc_notional(10000.0, 10000.0, 3, margin_buffer=1.0) == 30000.0
+
+
+class TestIsOppositeDirectionBetter:
+    def test_opposite_better_when_large_advantage(self):
+        # 현재: standx_long, sx=0.010 hb=0.005 → current net = 0.005 - 0.010 = -0.005
+        # 반대: standx_short → net = 0.010 - 0.005 = 0.005
+        # advantage = 0.005 - (-0.005) = 0.010 > 0.0005 threshold
+        assert is_opposite_direction_better("standx_long_hibachi_short", 0.010, 0.005) is True
+
+    def test_opposite_not_better_when_small_diff(self):
+        # 차이가 threshold 이하면 전환 안 함
+        assert is_opposite_direction_better("standx_long_hibachi_short", 0.005, 0.0052) is False
+
+    def test_opposite_better_for_short_direction(self):
+        # 현재: standx_short, sx=0.003 hb=0.010 → current net = 0.003 - 0.010 = -0.007
+        # 반대: standx_long → net = 0.010 - 0.003 = 0.007
+        assert is_opposite_direction_better("standx_short_hibachi_long", 0.003, 0.010) is True
+
+    def test_same_rates_no_switch(self):
+        assert is_opposite_direction_better("standx_long_hibachi_short", 0.005, 0.005) is False
