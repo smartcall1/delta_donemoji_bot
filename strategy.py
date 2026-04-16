@@ -40,5 +40,7 @@ def should_exit_cycle(
     return False
 
 
-def calc_notional(standx_balance: float, hibachi_balance: float, leverage: int) -> float:
-    return min(standx_balance, hibachi_balance) * leverage
+def calc_notional(standx_balance: float, hibachi_balance: float, leverage: int,
+                   margin_buffer: float = 0.95) -> float:
+    """작은 쪽 잔액의 95%로 노셔널 계산 (M1: 펀딩비 여유분 확보)"""
+    return min(standx_balance, hibachi_balance) * leverage * margin_buffer

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from enum import StrEnum
 
 
@@ -78,6 +80,13 @@ class BotState:
     cumulative_fees: float = 0.0
     total_sip2_estimate: float = 0.0
     weekly_hibachi_volume: float = 0.0
+    weekly_volume_reset_at: float = 0.0
+    # C6+I6+I7: 크래시 복구용 — 방향, 진입시각, 쿨다운 저장
+    current_direction: str = ""
+    cycle_entered_at: float = 0.0
+    cooldown_until: float = 0.0
+    initial_standx_balance: float = 0.0
+    initial_hibachi_balance: float = 0.0
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -88,11 +97,24 @@ class BotState:
     def from_dict(cls, d: dict) -> BotState:
         d = d.copy()
         d["cycle_state"] = CycleState(d["cycle_state"])
+        # M2: 미래 버전 필드 무시 (forward compat)
+        valid = {f.name for f in fields(cls)}
+        d = {k: v for k, v in d.items() if k in valid}
         return cls(**d)
 
     def save(self, path: str = "logs/bot_state.json"):
-        with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+        # C5: 원자적 쓰기 — 크래시 시 파일 손상 방지
+        dir_ = os.path.dirname(os.path.abspath(path))
+        os.makedirs(dir_, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(suffix=".tmp", dir=dir_)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.to_dict(), f, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
 
     @classmethod
     def load(cls, path: str = "logs/bot_state.json") -> BotState:

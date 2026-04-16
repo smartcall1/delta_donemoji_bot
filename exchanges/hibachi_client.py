@@ -8,6 +8,9 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+
 
 def _setup_env(api_key: str, private_key: str, public_key: str, account_id: str):
     os.environ["HIBACHI_API_ENDPOINT_PRODUCTION"] = "https://api.hibachi.xyz"
@@ -16,6 +19,20 @@ def _setup_env(api_key: str, private_key: str, public_key: str, account_id: str)
     os.environ["HIBACHI_PRIVATE_KEY_PRODUCTION"] = private_key
     os.environ["HIBACHI_PUBLIC_KEY_PRODUCTION"] = public_key
     os.environ["HIBACHI_ACCOUNT_ID_PRODUCTION"] = account_id
+
+
+async def _retry(fn, *args, **kwargs):
+    """I5: SDK 호출 재시도 래퍼"""
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            logger.warning("Hibachi API 재시도 %d/%d: %s", attempt + 1, MAX_RETRIES, e)
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+    raise last_err
 
 
 class HibachiClient:
@@ -56,34 +73,37 @@ class HibachiClient:
         return await asyncio.to_thread(self._rest.cancel_order, order_id=order_id)
 
     async def get_balance(self) -> dict:
-        return await self._get_balance_raw()
+        return await _retry(self._get_balance_raw)
 
     async def get_positions(self) -> list:
-        return await self._get_positions_raw()
+        return await _retry(self._get_positions_raw)
 
     async def get_mark_price(self, symbol: str) -> float:
-        data = await self._get_prices_raw(symbol)
+        data = await _retry(self._get_prices_raw, symbol)
         return float(data.get("mark_price", 0))
 
     async def get_funding_rate(self, symbol: str) -> float:
-        data = await self._get_stats_raw(symbol)
+        data = await _retry(self._get_stats_raw, symbol)
         return float(data.get("funding_rate", 0))
 
     async def place_limit_order(self, symbol: str, side: str, price: float, size: float) -> dict:
-        return await self._place_order_raw(
+        return await _retry(
+            self._place_order_raw,
             symbol=symbol, side=side, price=price, size=size, post_only=True,
         )
 
     async def cancel_order(self, order_id: str) -> dict:
-        return await self._cancel_order_raw(order_id)
+        return await _retry(self._cancel_order_raw, order_id)
 
-    async def close_position(self, symbol: str, side: str, size: float) -> dict:
+    async def close_position(self, symbol: str, side: str, size: float,
+                             slippage_pct: float = 0.005) -> dict:
+        """포지션 청산. slippage_pct: 기본 0.5% (I2: 0.1%→0.5% 확대)"""
         close_side = "SELL" if side == "BUY" else "BUY"
         price = await self.get_mark_price(symbol)
         if close_side == "BUY":
-            price *= 1.001
+            price *= (1 + slippage_pct)
         else:
-            price *= 0.999
+            price *= (1 - slippage_pct)
         return await self.place_limit_order(symbol, close_side, round(price, 2), size)
 
     async def close(self):

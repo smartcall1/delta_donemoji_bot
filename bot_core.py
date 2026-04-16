@@ -1,5 +1,22 @@
 # bot_core.py
-"""상태머신 기반 델타 뉴트럴 봇 코어"""
+"""상태머신 기반 델타 뉴트럴 봇 코어
+
+오딧 수정사항:
+  C1: 편측 체결 해제 시 재시도+검증
+  C2: 청산 실패 시 positions 유지 (성공한 것만 제거)
+  C3: 양쪽 개별 가격 조회 후 주문
+  C4: 중복 긴급 청산 제거 (메인루프에서 제거)
+  C6: 복구 시 Position 객체 재구성
+  C7: Stop 레이스 컨디션 방어 (_running 체크)
+  I1: 펀딩비용 누적 갱신
+  I6: 보유시간 상태에 저장
+  I7: 방향(direction) 상태에 저장
+  I8: 파일 리소스 누수 수정
+  M5: 주간 거래량 리셋
+  S1: 진입 3회 재시도
+  S2: DUSD 디페그 감시
+  S4: 일일 리포트 (09:00 KST)
+"""
 from __future__ import annotations
 
 import os
@@ -7,7 +24,7 @@ import json
 import time
 import logging
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import Config
 from models import CycleState, BotState, Position, Cycle, FundingSnapshot
@@ -19,12 +36,18 @@ from telegram_ui import TelegramUI
 
 logger = logging.getLogger(__name__)
 
+KST = timezone(timedelta(hours=9))
+ENTRY_MAX_RETRIES = 3
+
 
 class DeltaNeutralBot:
     def __init__(self):
         Config.ensure_dirs()
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
 
-        # 거래소 클라이언트
         self.standx = StandXClient(
             base_url=Config.STANDX_BASE_URL,
             jwt_token=Config.STANDX_JWT_TOKEN,
@@ -37,10 +60,8 @@ class DeltaNeutralBot:
             account_id=Config.HIBACHI_ACCOUNT_ID,
         )
 
-        # 텔레그램
         self.telegram = TelegramUI(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
 
-        # WebSocket 가격 피드
         self.standx_price: float = 0.0
         self.hibachi_price: float = 0.0
         self.standx_ws = StandXWSClient(
@@ -50,16 +71,17 @@ class DeltaNeutralBot:
             Config.HIBACHI_WS_URL, Config.PAIR_HIBACHI, self._on_hibachi_price
         )
 
-        # 상태
         self.state = self._load_state()
         self._positions: dict[str, Position] = {}
         self._current_cycle: Cycle | None = None
-        self._cycle_entered_at: float | None = None
-        self._cooldown_until: float | None = None
+        self._cycle_entered_at: float | None = self.state.cycle_entered_at or None
+        self._cooldown_until: float | None = self.state.cooldown_until or None
         self._cumulative_funding_cost: float = 0.0
-        self._initial_standx_balance: float = 0.0
-        self._initial_hibachi_balance: float = 0.0
+        self._initial_standx_balance: float = self.state.initial_standx_balance
+        self._initial_hibachi_balance: float = self.state.initial_hibachi_balance
         self._running = False
+        self._last_warning_time: float = 0.0
+        self._last_daily_report: float = 0.0
 
     def _load_state(self) -> BotState:
         path = os.path.join(Config.LOG_DIR, "bot_state.json")
@@ -71,6 +93,11 @@ class DeltaNeutralBot:
         return BotState()
 
     def _save_state(self):
+        # I6+I7: 휘발성 상태도 저장
+        if self._cycle_entered_at:
+            self.state.cycle_entered_at = self._cycle_entered_at
+        if self._cooldown_until:
+            self.state.cooldown_until = self._cooldown_until
         self.state.save(os.path.join(Config.LOG_DIR, "bot_state.json"))
 
     def _on_standx_price(self, price: float):
@@ -84,10 +111,18 @@ class DeltaNeutralBot:
         hibachi_side = "SELL" if "hibachi_short" in direction else "BUY"
         return standx_side, hibachi_side
 
+    def _get_worst_margin(self) -> float:
+        """양쪽 마진율 중 최소값 반환"""
+        ratios = []
+        for pos in self._positions.values():
+            price = self.standx_price if pos.exchange == "standx" else self.hibachi_price
+            if price > 0:
+                ratios.append(pos.calc_margin_ratio(price))
+        return min(ratios) if ratios else 100.0
+
     async def _check_margin_safety(self) -> MarginLevel:
-        """양쪽 마진율 중 낮은 쪽 기준으로 위험도 판단"""
         worst = MarginLevel.NORMAL
-        for key, pos in self._positions.items():
+        for pos in self._positions.values():
             price = self.standx_price if pos.exchange == "standx" else self.hibachi_price
             if price <= 0:
                 continue
@@ -99,99 +134,211 @@ class DeltaNeutralBot:
                 worst = MarginLevel.WARNING
         return worst
 
-    async def _execute_enter(self, direction: str, notional: float):
-        """양쪽 동시 진입"""
+    async def _execute_enter(self, direction: str, notional: float) -> bool:
+        """양쪽 동시 진입 — C3: 개별 가격, S1: 3회 재시도"""
         standx_side, hibachi_side = self._parse_direction(direction)
-        price = self.standx_price or self.hibachi_price
-        if price <= 0:
-            logger.error("가격 정보 없음, 진입 불가")
-            return False
 
-        quantity = notional / price
-        # Limit 주문 양쪽 제출
-        try:
-            standx_result = await self.standx.place_limit_order(
-                Config.PAIR_STANDX, standx_side, price, round(quantity, 4)
-            )
-            hibachi_result = await self.hibachi.place_limit_order(
-                Config.PAIR_HIBACHI, hibachi_side, price, round(quantity, 6)
-            )
-        except Exception as e:
-            logger.error("주문 제출 실패: %s", e)
-            await self.telegram.send_alert(f"🚨 주문 제출 실패: {e}")
-            return False
+        for attempt in range(ENTRY_MAX_RETRIES):
+            # C3: 양쪽 개별 가격 조회
+            try:
+                sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
+                sx_price = float(sx_market.get("mark_price", 0))
+                hb_price = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
+            except Exception as e:
+                logger.error("가격 조회 실패 (시도 %d/%d): %s", attempt + 1, ENTRY_MAX_RETRIES, e)
+                await asyncio.sleep(5)
+                continue
 
-        # 체결 확인 (30초 대기)
-        await asyncio.sleep(30)
+            if sx_price <= 0 or hb_price <= 0:
+                logger.error("가격 정보 없음 (sx=%.2f, hb=%.2f)", sx_price, hb_price)
+                await asyncio.sleep(5)
+                continue
 
-        # 체결 상태 확인 (양쪽 포지션 조회)
-        standx_positions = await self.standx.get_positions()
-        hibachi_positions = await self.hibachi.get_positions()
+            sx_quantity = notional / sx_price
+            hb_quantity = notional / hb_price
 
-        has_standx = any(p.get("symbol") == Config.PAIR_STANDX for p in standx_positions)
-        has_hibachi = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hibachi_positions)
+            try:
+                await self.standx.place_limit_order(
+                    Config.PAIR_STANDX, standx_side, sx_price, round(sx_quantity, 4)
+                )
+                await self.hibachi.place_limit_order(
+                    Config.PAIR_HIBACHI, hibachi_side, hb_price, round(hb_quantity, 6)
+                )
+            except Exception as e:
+                logger.error("주문 제출 실패 (시도 %d/%d): %s", attempt + 1, ENTRY_MAX_RETRIES, e)
+                await self.telegram.send_alert(f"⚠️ 주문 제출 실패 (시도 {attempt + 1}/{ENTRY_MAX_RETRIES}): {e}")
+                await asyncio.sleep(5)
+                continue
 
-        if has_standx and has_hibachi:
-            # 양쪽 체결 성공
-            margin = notional / Config.LEVERAGE
-            self._positions["standx"] = Position(
-                exchange="standx", symbol=Config.PAIR_STANDX,
-                side="LONG" if standx_side == "BUY" else "SHORT",
-                notional=notional, entry_price=price,
-                leverage=Config.LEVERAGE, margin=margin,
-            )
-            self._positions["hibachi"] = Position(
-                exchange="hibachi", symbol=Config.PAIR_HIBACHI,
-                side="LONG" if hibachi_side == "BUY" else "SHORT",
-                notional=notional, entry_price=price,
-                leverage=Config.LEVERAGE, margin=margin,
-            )
-            return True
+            await asyncio.sleep(30)
 
-        # 편측 체결 — 체결된 쪽 청산
-        if has_standx and not has_hibachi:
-            logger.warning("편측 체결: StandX만 체결, 청산")
-            await self.standx.close_position(Config.PAIR_STANDX, standx_side, round(quantity, 4))
-            await self.telegram.send_alert("⚠️ 편측 체결: StandX만 체결됨, 청산 완료")
-        elif has_hibachi and not has_standx:
-            logger.warning("편측 체결: Hibachi만 체결, 청산")
-            await self.hibachi.close_position(Config.PAIR_HIBACHI, hibachi_side, round(quantity, 6))
-            await self.telegram.send_alert("⚠️ 편측 체결: Hibachi만 체결됨, 청산 완료")
+            standx_positions = await self.standx.get_positions()
+            hibachi_positions = await self.hibachi.get_positions()
+            has_standx = any(p.get("symbol") == Config.PAIR_STANDX for p in standx_positions)
+            has_hibachi = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hibachi_positions)
+
+            if has_standx and has_hibachi:
+                margin = notional / Config.LEVERAGE
+                self._positions["standx"] = Position(
+                    exchange="standx", symbol=Config.PAIR_STANDX,
+                    side="LONG" if standx_side == "BUY" else "SHORT",
+                    notional=notional, entry_price=sx_price,
+                    leverage=Config.LEVERAGE, margin=margin,
+                )
+                self._positions["hibachi"] = Position(
+                    exchange="hibachi", symbol=Config.PAIR_HIBACHI,
+                    side="LONG" if hibachi_side == "BUY" else "SHORT",
+                    notional=notional, entry_price=hb_price,
+                    leverage=Config.LEVERAGE, margin=margin,
+                )
+                return True
+
+            # C1: 편측 체결 — 공격적 슬리피지로 해제 + 검증
+            if has_standx and not has_hibachi:
+                logger.warning("편측 체결: StandX만 (시도 %d/%d)", attempt + 1, ENTRY_MAX_RETRIES)
+                await self.standx.close_position(
+                    Config.PAIR_STANDX, standx_side, round(sx_quantity, 4), slippage_pct=0.01
+                )
+                await asyncio.sleep(5)
+                # 해제 검증
+                remaining = await self.standx.get_positions()
+                still_open = any(p.get("symbol") == Config.PAIR_STANDX for p in remaining)
+                if still_open:
+                    await self.telegram.send_alert(
+                        "🚨 편측 해제 실패! StandX 포지션이 여전히 열려있음. 수동 확인 필요!"
+                    )
+                    return False
+                await self.telegram.send_alert(f"⚠️ 편측 체결 해제 완료 (시도 {attempt + 1})")
+
+            elif has_hibachi and not has_standx:
+                logger.warning("편측 체결: Hibachi만 (시도 %d/%d)", attempt + 1, ENTRY_MAX_RETRIES)
+                await self.hibachi.close_position(
+                    Config.PAIR_HIBACHI, hibachi_side, round(hb_quantity, 6), slippage_pct=0.01
+                )
+                await asyncio.sleep(5)
+                remaining = await self.hibachi.get_positions()
+                still_open = any(p.get("symbol") == Config.PAIR_HIBACHI for p in remaining)
+                if still_open:
+                    await self.telegram.send_alert(
+                        "🚨 편측 해제 실패! Hibachi 포지션이 여전히 열려있음. 수동 확인 필요!"
+                    )
+                    return False
+                await self.telegram.send_alert(f"⚠️ 편측 체결 해제 완료 (시도 {attempt + 1})")
+
+            await asyncio.sleep(5)
+
+        await self.telegram.send_alert(f"🚨 진입 {ENTRY_MAX_RETRIES}회 실패, IDLE 복귀")
         return False
 
-    async def _execute_exit(self):
-        """양쪽 동시 청산"""
+    async def _execute_exit(self) -> bool:
+        """양쪽 동시 청산 — C2: 실패한 쪽은 positions에 유지"""
+        failed = []
+        succeeded = []
+
         for key, pos in list(self._positions.items()):
             try:
                 quantity = pos.notional / pos.entry_price
                 if pos.exchange == "standx":
                     side = "BUY" if pos.side == "LONG" else "SELL"
-                    await self.standx.close_position(Config.PAIR_STANDX, side, round(quantity, 4))
+                    await self.standx.close_position(
+                        Config.PAIR_STANDX, side, round(quantity, 4), slippage_pct=0.005
+                    )
                 else:
                     side = "BUY" if pos.side == "LONG" else "SELL"
-                    await self.hibachi.close_position(Config.PAIR_HIBACHI, side, round(quantity, 6))
+                    await self.hibachi.close_position(
+                        Config.PAIR_HIBACHI, side, round(quantity, 6), slippage_pct=0.005
+                    )
+                succeeded.append(key)
             except Exception as e:
                 logger.error("%s 청산 실패: %s", key, e)
-                await self.telegram.send_alert(f"🚨 {key} 청산 실패: {e}")
-        self._positions.clear()
+                await self.telegram.send_alert(f"🚨 {key} 청산 실패: {e}\n수동 확인 필요!")
+                failed.append(key)
+
+        # C2: 성공한 것만 제거
+        for key in succeeded:
+            del self._positions[key]
+
+        if failed:
+            logger.error("부분 청산 실패: %s — 재시도 대기", failed)
+            return False
+        return True
 
     def _log_cycle(self, cycle: Cycle):
         path = os.path.join(Config.LOG_DIR, "cycles.jsonl")
         with open(path, "a") as f:
             f.write(cycle.to_jsonl() + "\n")
 
+    def _check_weekly_reset(self):
+        """M5: 매주 월요일 00:00 UTC에 주간 거래량 리셋"""
+        now = time.time()
+        if self.state.weekly_volume_reset_at == 0:
+            self.state.weekly_volume_reset_at = now
+            return
+        elapsed = now - self.state.weekly_volume_reset_at
+        if elapsed > 7 * 24 * 3600:
+            self.state.weekly_hibachi_volume = 0.0
+            self.state.weekly_volume_reset_at = now
+            logger.info("주간 거래량 리셋")
+
+    async def _send_daily_report(self):
+        """S4: 일일 리포트 (09:00 KST)"""
+        now_kst = datetime.now(KST)
+        if now_kst.hour != 9 or now_kst.minute > 5:
+            return
+        if time.time() - self._last_daily_report < 3600:
+            return
+        self._last_daily_report = time.time()
+
+        sip2 = estimate_sip2_yield(
+            self.state.standx_balance, self._initial_standx_balance,
+            self.state.cumulative_funding, self.state.cumulative_fees, 0.0
+        )
+        text = (
+            f"📊 <b>일일 리포트</b> ({now_kst.strftime('%Y-%m-%d')})\n"
+            f"상태: {self.state.cycle_state}\n"
+            f"StandX: ${self.state.standx_balance:,.2f}\n"
+            f"Hibachi: ${self.state.hibachi_balance:,.2f}\n"
+            f"누적 펀딩수익: ${self.state.cumulative_funding:,.2f}\n"
+            f"SIP-2 추정: ${sip2:,.2f}\n"
+            f"주간 거래량: ${self.state.weekly_hibachi_volume:,.0f} / $100,000"
+        )
+        await self.telegram.send_alert(text)
+
+    async def _check_dusd_depeg(self):
+        """S2: DUSD 디페그 > 1% 시 경고 (5분 쿨다운)"""
+        if time.time() - self._last_warning_time < 300:
+            return
+        try:
+            sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
+            index_price = float(sx_market.get("index_price", 0))
+            mark_price = float(sx_market.get("mark_price", 0))
+            if index_price > 0 and mark_price > 0:
+                depeg = abs(mark_price - index_price) / index_price
+                if depeg > 0.01:
+                    self._last_warning_time = time.time()
+                    await self.telegram.send_alert(
+                        f"⚠️ DUSD 디페그 경고: {depeg:.2%}\n"
+                        f"Mark: ${mark_price:,.2f} / Index: ${index_price:,.2f}"
+                    )
+        except Exception:
+            pass
+
     async def _run_state_machine(self):
-        """상태머신 1회 평가"""
+        # C7: Stop 레이스 방어
+        if not self._running:
+            return
+
         state = self.state.cycle_state
 
         if state == CycleState.IDLE:
             if self._cooldown_until and time.time() < self._cooldown_until:
                 return
+            self._cooldown_until = None
+            self.state.cooldown_until = 0.0
             self.state.cycle_state = CycleState.ANALYZE
             self._save_state()
 
         elif state == CycleState.ANALYZE:
-            # 펀딩레이트 조회 및 방향 결정
             try:
                 sx_data = await self.standx.get_funding_rate(Config.PAIR_STANDX)
                 sx_rate = float(sx_data.get("funding_rate", 0))
@@ -202,7 +349,6 @@ class DeltaNeutralBot:
 
                 direction = decide_direction(sx_8h, hb_8h)
 
-                # 잔액 조회 → 노셔널 계산
                 sx_bal = await self.standx.get_balance()
                 hb_bal = await self.hibachi.get_balance()
                 sx_available = float(sx_bal.get("available_balance", 0))
@@ -212,15 +358,24 @@ class DeltaNeutralBot:
                 self.state.hibachi_balance = hb_available
                 self._initial_standx_balance = sx_available
                 self._initial_hibachi_balance = hb_available
+                self.state.initial_standx_balance = sx_available
+                self.state.initial_hibachi_balance = hb_available
 
                 notional = calc_notional(sx_available, hb_available, Config.LEVERAGE)
 
                 logger.info("분석 완료: 방향=%s, 노셔널=$%.2f", direction, notional)
+
+                # C7: 진입 전 _running 재확인
+                if not self._running:
+                    self.state.cycle_state = CycleState.IDLE
+                    self._save_state()
+                    return
+
+                self.state.current_cycle_id += 1
+                self.state.current_direction = direction
                 self.state.cycle_state = CycleState.ENTER
                 self._save_state()
 
-                # ENTER 즉시 실행
-                self.state.current_cycle_id += 1
                 success = await self._execute_enter(direction, notional)
                 if success:
                     self._cycle_entered_at = time.time()
@@ -231,9 +386,8 @@ class DeltaNeutralBot:
                         notional=notional,
                     )
                     self.state.cycle_state = CycleState.HOLD
-                    # 거래량 추적
                     self.state.weekly_hibachi_volume += notional
-                    fee = notional * 0.0001  # StandX maker 0.01%
+                    fee = notional * 0.0001
                     self.state.cumulative_fees += fee
                     await self.telegram.send_alert(
                         f"✅ 사이클 #{self.state.current_cycle_id} 진입\n"
@@ -256,30 +410,26 @@ class DeltaNeutralBot:
                 return
             hold_hours = (time.time() - self._cycle_entered_at) / 3600
 
-            # 마진 안전 체크
             margin_level = await self._check_margin_safety()
             if margin_level == MarginLevel.EMERGENCY:
                 logger.warning("🚨 긴급 청산!")
                 await self.telegram.send_alert("🚨 마진율 위험! 양쪽 긴급 청산 실행!")
-                await self._execute_exit()
-                self.state.cycle_state = CycleState.COOLDOWN
-                self._cooldown_until = time.time() + Config.COOLDOWN_HOURS * 3600
+                success = await self._execute_exit()
+                if success:
+                    self.state.cycle_state = CycleState.COOLDOWN
+                    self._cooldown_until = time.time() + Config.COOLDOWN_HOURS * 3600
+                else:
+                    await self.telegram.send_alert("🚨 긴급 청산 부분 실패! 수동 확인 필요!")
                 self._save_state()
                 return
-            elif margin_level == MarginLevel.WARNING:
-                worst_ratio = min(
-                    (p.calc_margin_ratio(self.standx_price if p.exchange == "standx" else self.hibachi_price)
-                     for p in self._positions.values() if (self.standx_price if p.exchange == "standx" else self.hibachi_price) > 0),
-                    default=100.0,
-                )
-                await self.telegram.send_alert(f"⚠️ 마진율 경고: {worst_ratio:.1f}%")
 
-            # 전환 판단
-            worst_margin = min(
-                (p.calc_margin_ratio(self.standx_price if p.exchange == "standx" else self.hibachi_price)
-                 for p in self._positions.values() if (self.standx_price if p.exchange == "standx" else self.hibachi_price) > 0),
-                default=100.0,
-            )
+            if margin_level == MarginLevel.WARNING:
+                if time.time() - self._last_warning_time > 300:
+                    self._last_warning_time = time.time()
+                    worst = self._get_worst_margin()
+                    await self.telegram.send_alert(f"⚠️ 마진율 경고: {worst:.1f}%")
+
+            worst_margin = self._get_worst_margin()
             if should_exit_cycle(
                 hold_hours=hold_hours,
                 min_hold_hours=Config.MIN_HOLD_HOURS,
@@ -293,9 +443,13 @@ class DeltaNeutralBot:
                 self._save_state()
 
         elif state == CycleState.EXIT:
-            await self._execute_exit()
+            success = await self._execute_exit()
 
-            # 사이클 기록
+            if not success:
+                # C2: 부분 실패 시 EXIT 유지, 다음 틱에 재시도
+                self._save_state()
+                return
+
             if self._current_cycle:
                 self._current_cycle.exited_at = time.time()
                 sx_bal = await self.standx.get_balance()
@@ -304,7 +458,6 @@ class DeltaNeutralBot:
                 self._current_cycle.hibachi_balance_after = float(hb_bal.get("available", 0))
                 self.state.standx_balance = self._current_cycle.standx_balance_after
                 self.state.hibachi_balance = self._current_cycle.hibachi_balance_after
-                # 거래량 추적 (청산)
                 self.state.weekly_hibachi_volume += self._current_cycle.notional
                 fee = self._current_cycle.notional * 0.0001
                 self.state.cumulative_fees += fee
@@ -320,6 +473,9 @@ class DeltaNeutralBot:
                 )
                 self._current_cycle = None
 
+            self._cycle_entered_at = None
+            self.state.cycle_entered_at = 0.0
+            self.state.current_direction = ""
             self.state.cycle_state = CycleState.COOLDOWN
             self._cooldown_until = time.time() + Config.COOLDOWN_HOURS * 3600
             self._save_state()
@@ -327,44 +483,91 @@ class DeltaNeutralBot:
         elif state == CycleState.COOLDOWN:
             if self._cooldown_until and time.time() >= self._cooldown_until:
                 self._cooldown_until = None
+                self.state.cooldown_until = 0.0
                 self.state.cycle_state = CycleState.IDLE
                 self._save_state()
                 logger.info("쿨다운 종료, IDLE 복귀")
 
     async def _recovery_check(self):
-        """봇 재시작 시 기존 포지션 복구"""
+        """봇 재시작 시 기존 포지션 복구 — C6: Position 객체 재구성"""
         sx_positions = await self.standx.get_positions()
         hb_positions = await self.hibachi.get_positions()
 
-        has_sx = any(p.get("symbol") == Config.PAIR_STANDX for p in sx_positions)
-        has_hb = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hb_positions)
+        sx_pos = next((p for p in sx_positions if p.get("symbol") == Config.PAIR_STANDX), None)
+        hb_pos = next((p for p in hb_positions if p.get("symbol") == Config.PAIR_HIBACHI), None)
 
-        if has_sx and has_hb:
+        if sx_pos and hb_pos:
             logger.info("양쪽 포지션 감지 → HOLD 복구")
+
+            # C6: Position 객체 재구성
+            sx_size = abs(float(sx_pos.get("position_size", sx_pos.get("size", 0))))
+            sx_entry = float(sx_pos.get("entry_price", sx_pos.get("avg_price", 0)))
+            sx_side_raw = sx_pos.get("side", "").upper()
+            sx_side = "LONG" if sx_side_raw in ("LONG", "BUY") else "SHORT"
+            sx_notional = sx_size * sx_entry if sx_entry > 0 else 0
+
+            hb_size = abs(float(hb_pos.get("size", hb_pos.get("position_size", 0))))
+            hb_entry = float(hb_pos.get("entry_price", hb_pos.get("avg_price", 0)))
+            hb_side_raw = hb_pos.get("side", "").upper()
+            hb_side = "LONG" if hb_side_raw in ("LONG", "BUY") else "SHORT"
+            hb_notional = hb_size * hb_entry if hb_entry > 0 else 0
+
+            notional = max(sx_notional, hb_notional) or 30000.0
+
+            self._positions["standx"] = Position(
+                exchange="standx", symbol=Config.PAIR_STANDX,
+                side=sx_side, notional=notional,
+                entry_price=sx_entry or 1800.0,
+                leverage=Config.LEVERAGE,
+                margin=notional / Config.LEVERAGE,
+            )
+            self._positions["hibachi"] = Position(
+                exchange="hibachi", symbol=Config.PAIR_HIBACHI,
+                side=hb_side, notional=notional,
+                entry_price=hb_entry or 1800.0,
+                leverage=Config.LEVERAGE,
+                margin=notional / Config.LEVERAGE,
+            )
+
             self.state.cycle_state = CycleState.HOLD
-            if not self._cycle_entered_at:
+            # I6: 저장된 진입시각 복구 (없으면 현재시각)
+            if self.state.cycle_entered_at > 0:
+                self._cycle_entered_at = self.state.cycle_entered_at
+            else:
                 self._cycle_entered_at = time.time()
-            await self.telegram.send_alert("🔁 봇 재시작: 기존 포지션 감지, HOLD 상태 복구")
-        elif has_sx or has_hb:
-            side = "StandX" if has_sx else "Hibachi"
+
+            await self.telegram.send_alert(
+                f"🔁 봇 재시작: 포지션 복구 완료\n"
+                f"StandX: {sx_side} ${notional:,.0f}\n"
+                f"Hibachi: {hb_side} ${notional:,.0f}\n"
+                f"방향: {self.state.current_direction or '미확인'}"
+            )
+
+        elif sx_pos or hb_pos:
+            side = "StandX" if sx_pos else "Hibachi"
             logger.warning("편측 포지션 감지: %s", side)
-            await self.telegram.send_alert(f"⚠️ 봇 재시작: {side}에만 포지션 존재! 수동 확인 필요")
+            await self.telegram.send_alert(
+                f"⚠️ 봇 재시작: {side}에만 포지션 존재! 수동 확인 필요"
+            )
         else:
             if self.state.cycle_state not in (CycleState.IDLE, CycleState.COOLDOWN):
                 self.state.cycle_state = CycleState.IDLE
+
         self._save_state()
 
     def _register_telegram_callbacks(self):
         async def on_status(cb):
-            sx_p = self.standx_price
-            hb_p = self.hibachi_price
             text = (
                 f"📊 <b>Status</b>\n"
                 f"상태: {self.state.cycle_state}\n"
-                f"StandX: ${self.state.standx_balance:,.2f} (ETH ${sx_p:,.2f})\n"
-                f"Hibachi: ${self.state.hibachi_balance:,.2f} (ETH ${hb_p:,.2f})\n"
+                f"StandX: ${self.state.standx_balance:,.2f} (ETH ${self.standx_price:,.2f})\n"
+                f"Hibachi: ${self.state.hibachi_balance:,.2f} (ETH ${self.hibachi_price:,.2f})\n"
+                f"마진율: {self._get_worst_margin():.1f}%\n"
                 f"주간 거래량: ${self.state.weekly_hibachi_volume:,.0f} / $100,000"
             )
+            if self._cycle_entered_at:
+                hold_h = (time.time() - self._cycle_entered_at) / 3600
+                text += f"\n보유: {hold_h:.1f}시간"
             await self.telegram.send_main_menu(text)
 
         async def on_history(cb):
@@ -372,7 +575,9 @@ class DeltaNeutralBot:
             if not os.path.exists(path):
                 await self.telegram.send_alert("📋 아직 완료된 사이클 없음")
                 return
-            lines = open(path).readlines()[-5:]
+            # I8: 리소스 누수 수정
+            with open(path) as f:
+                lines = f.readlines()[-5:]
             text = "📋 <b>최근 사이클</b>\n\n"
             for line in lines:
                 c = json.loads(line)
@@ -404,13 +609,15 @@ class DeltaNeutralBot:
                 self._save_state()
                 await self.telegram.send_alert("🔄 수동 리밸런싱 트리거됨")
             else:
-                await self.telegram.send_alert(f"현재 상태({self.state.cycle_state})에서는 리밸런싱 불가")
+                await self.telegram.send_alert(
+                    f"현재 상태({self.state.cycle_state})에서는 리밸런싱 불가"
+                )
 
         async def on_stop(cb):
             await self.telegram.send_alert("⏹ 봇 종료 중... 포지션 청산")
+            self._running = False  # C7: 먼저 플래그 설정
             if self._positions:
                 await self._execute_exit()
-            self._running = False
 
         self.telegram.register_callback("status", on_status)
         self.telegram.register_callback("history", on_history)
@@ -419,25 +626,20 @@ class DeltaNeutralBot:
         self.telegram.register_callback("stop", on_stop)
 
     async def run(self):
-        """메인 루프"""
         self._running = True
         self._register_telegram_callbacks()
 
-        # 시작 알림
         await self.telegram.send_main_menu(
             f"🚀 Delta Neutral Bot 시작\n상태: {self.state.cycle_state}"
         )
 
-        # 포지션 복구
         await self._recovery_check()
 
-        # WebSocket 시작 (백그라운드)
         ws_tasks = [
             asyncio.create_task(self.standx_ws.connect()),
             asyncio.create_task(self.hibachi_ws.connect()),
         ]
 
-        # REST fallback 가격 업데이트
         last_balance_check = 0
         last_funding_check = 0
 
@@ -445,10 +647,13 @@ class DeltaNeutralBot:
             while self._running:
                 now = time.time()
 
-                # 텔레그램 폴링
                 await self.telegram.poll_updates()
 
-                # REST fallback: 가격 (WS가 안 되면)
+                # C7: 폴링 후 다시 확인
+                if not self._running:
+                    break
+
+                # REST fallback: 가격 (WS 미수신 시)
                 if self.standx_price == 0 or self.hibachi_price == 0:
                     try:
                         sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
@@ -457,19 +662,19 @@ class DeltaNeutralBot:
                     except Exception:
                         pass
 
-                # 상태머신 평가
                 await self._run_state_machine()
 
-                # 마진 안전 체크 (HOLD 상태에서 WS 가격 기반)
-                if self.state.cycle_state == CycleState.HOLD and self._positions:
-                    level = await self._check_margin_safety()
-                    if level == MarginLevel.EMERGENCY:
-                        logger.warning("🚨 WS 가격 기반 긴급 청산!")
-                        await self.telegram.send_alert("🚨 실시간 가격 기반 긴급 청산!")
-                        await self._execute_exit()
-                        self.state.cycle_state = CycleState.COOLDOWN
-                        self._cooldown_until = now + Config.COOLDOWN_HOURS * 3600
-                        self._save_state()
+                # C4: 중복 마진 체크 제거 — _run_state_machine 내 HOLD에서 처리
+
+                # M5: 주간 거래량 리셋 체크
+                self._check_weekly_reset()
+
+                # S4: 일일 리포트
+                await self._send_daily_report()
+
+                # S2: DUSD 디페그 감시
+                if self.state.cycle_state == CycleState.HOLD:
+                    await self._check_dusd_depeg()
 
                 # 잔액 체크 (5분)
                 if now - last_balance_check > Config.POLL_BALANCE_SECONDS:
@@ -483,25 +688,34 @@ class DeltaNeutralBot:
                     except Exception as e:
                         logger.error("잔액 조회 실패: %s", e)
 
-                # 펀딩레이트 체크 (1시간)
+                # 펀딩레이트 체크 (1시간) + I1: 누적 비용 갱신
                 if now - last_funding_check > Config.POLL_FUNDING_SECONDS:
                     last_funding_check = now
                     try:
                         sx_data = await self.standx.get_funding_rate(Config.PAIR_STANDX)
                         sx_rate = float(sx_data.get("funding_rate", 0))
                         hb_rate = await self.hibachi.get_funding_rate(Config.PAIR_HIBACHI)
-                        snap = FundingSnapshot(sx_rate, hb_rate, now)
-                        # 로그
+
+                        # I1: HOLD 상태에서 펀딩비용 누적
+                        if self.state.cycle_state == CycleState.HOLD and self._positions:
+                            direction = self.state.current_direction
+                            if "standx_long" in direction:
+                                net_cost = sx_rate - (hb_rate / 8)
+                            else:
+                                net_cost = (hb_rate / 8) - sx_rate
+                            if net_cost > 0:
+                                self._cumulative_funding_cost += net_cost
+                            self.state.cumulative_funding += (sx_rate - (hb_rate / 8))
+
                         path = os.path.join(Config.LOG_DIR, "funding_history.jsonl")
                         with open(path, "a") as f:
                             f.write(json.dumps({"sx": sx_rate, "hb": hb_rate, "ts": now}) + "\n")
                     except Exception as e:
                         logger.error("펀딩레이트 조회 실패: %s", e)
 
-                await asyncio.sleep(5)  # 5초 간격 루프
+                await asyncio.sleep(5)
 
         finally:
-            # 정리
             await self.standx_ws.disconnect()
             await self.hibachi_ws.disconnect()
             await self.standx.close()

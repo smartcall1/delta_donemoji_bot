@@ -43,7 +43,11 @@ class TestShouldExitCycle:
 
 class TestCalcNotional:
     def test_match_smaller_balance(self):
-        assert calc_notional(10150.0, 9820.0, 3) == 9820.0 * 3
+        # M1: 95% 마진 버퍼 적용
+        assert calc_notional(10150.0, 9820.0, 3) == 9820.0 * 3 * 0.95
 
     def test_equal_balances(self):
-        assert calc_notional(10000.0, 10000.0, 3) == 30000.0
+        assert calc_notional(10000.0, 10000.0, 3) == 30000.0 * 0.95
+
+    def test_custom_buffer(self):
+        assert calc_notional(10000.0, 10000.0, 3, margin_buffer=1.0) == 30000.0
