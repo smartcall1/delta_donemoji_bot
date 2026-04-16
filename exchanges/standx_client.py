@@ -5,9 +5,12 @@ import base64
 import json
 import logging
 import asyncio
+import time
+import uuid
 from typing import Callable
 
 import aiohttp
+import base58
 from nacl.signing import SigningKey
 
 logger = logging.getLogger(__name__)
@@ -20,15 +23,21 @@ class StandXClient:
     def __init__(self, base_url: str, jwt_token: str, private_key_hex: str):
         self.base_url = base_url.rstrip("/")
         self.jwt_token = jwt_token
-        # 키 포맷 자동 감지: hex(64자) 또는 base64
+        # 키 포맷 자동 감지: hex(64자) / base64(=포함) / base58
         try:
             key_bytes = bytes.fromhex(private_key_hex)
         except ValueError:
-            key_bytes = base64.b64decode(private_key_hex)
-        # Ed25519 seed는 32바이트, 프리픽스가 있으면 마지막 32바이트 사용
+            try:
+                key_bytes = base58.b58decode(private_key_hex)
+            except Exception:
+                key_bytes = base64.b64decode(private_key_hex)
         if len(key_bytes) > 32:
-            key_bytes = key_bytes[-32:]
+            key_bytes = key_bytes[:32]
         self._signing_key = SigningKey(key_bytes)
+        # requestId = 공개키의 base58 인코딩
+        self._request_id = base58.b58encode(
+            self._signing_key.verify_key.encode()
+        ).decode()
         self._session: aiohttp.ClientSession | None = None
 
     async def _ensure_session(self):
@@ -42,9 +51,10 @@ class StandXClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    def _sign_body(self, body: str) -> str:
-        signed = self._signing_key.sign(body.encode())
-        return signed.signature.hex()
+    def _sign(self, message: str) -> str:
+        """Ed25519 서명 → base64"""
+        signed = self._signing_key.sign(message.encode("utf-8"))
+        return base64.b64encode(signed.signature).decode()
 
     async def _request(self, method: str, path: str, params: dict | None = None) -> dict:
         # I5: 재시도 로직
@@ -74,11 +84,32 @@ class StandXClient:
             try:
                 await self._ensure_session()
                 url = f"{self.base_url}{path}"
+                sig_id = str(uuid.uuid4())
+                timestamp = str(int(time.time() * 1000))
                 body_str = json.dumps(body, separators=(",", ":"))
-                signature = self._sign_body(body_str)
-                headers = {"x-request-signature": signature, "Content-Type": "application/json"}
+                # 메인 서명: "v1,{uuid},{timestamp},{body}"
+                full_msg = f"v1,{sig_id},{timestamp},{body_str}"
+                signature = self._sign(full_msg)
+                # 바디 단독 서명
+                body_sig = self._sign(body_str)
+                headers = {
+                    "X-Request-Sign-Version": "v1",
+                    "X-Request-Id": sig_id,
+                    "X-Request-Timestamp": timestamp,
+                    "X-Request-Signature": signature,
+                    "X-Body-Signature": body_sig,
+                    "Content-Type": "application/json",
+                }
                 async with self._session.request(method, url, data=body_str, headers=headers) as resp:
-                    data = await resp.json()
+                    # 응답이 JSON이 아닐 수 있음 (422 등)
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        if resp.status != 200:
+                            logger.error("StandX signed API error: %s %s → %d %s", method, path, resp.status, text[:200])
+                            raise Exception(f"StandX {resp.status}: {text[:200]}")
+                        data = {"raw": text}
                     if resp.status != 200:
                         logger.error("StandX signed API error: %s %s → %d %s", method, path, resp.status, data)
                     if isinstance(data, dict) and "code" in data:
@@ -115,8 +146,13 @@ class StandXClient:
 
     async def place_limit_order(self, symbol: str, side: str, price: float, quantity: float) -> dict:
         body = {
-            "symbol": symbol, "side": side, "type": "LIMIT",
-            "price": str(price), "quantity": str(quantity), "time_in_force": "GTC",
+            "symbol": symbol,
+            "side": side.lower(),
+            "order_type": "limit",
+            "price": str(price),
+            "qty": str(quantity),
+            "time_in_force": "gtc",
+            "reduce_only": False,
         }
         resp = await self._signed_request("POST", "/api/new_order", body)
         return resp.get("data", {})

@@ -117,6 +117,14 @@ class DeltaNeutralBot:
                 return float(bal[key])
         return 0.0
 
+    @staticmethod
+    def _parse_hb_balance(bal: dict) -> float:
+        """Hibachi 잔액 파싱 — SDK dataclass 변환 후 키 호환"""
+        for key in ("available", "balance", "equity", "total"):
+            if key in bal:
+                return float(bal[key])
+        return 0.0
+
     def _parse_direction(self, direction: str) -> tuple[str, str]:
         standx_side = "BUY" if "standx_long" in direction else "SELL"
         hibachi_side = "SELL" if "hibachi_short" in direction else "BUY"
@@ -423,7 +431,7 @@ class DeltaNeutralBot:
                 sx_bal = await self.standx.get_balance()
                 hb_bal = await self.hibachi.get_balance()
                 sx_available = self._parse_sx_balance(sx_bal)
-                hb_available = float(hb_bal.get("available", 0))
+                hb_available = self._parse_hb_balance(hb_bal)
 
                 self.state.standx_balance = sx_available
                 self.state.hibachi_balance = hb_available
@@ -526,7 +534,7 @@ class DeltaNeutralBot:
                 sx_bal = await self.standx.get_balance()
                 hb_bal = await self.hibachi.get_balance()
                 self._current_cycle.standx_balance_after = self._parse_sx_balance(sx_bal)
-                self._current_cycle.hibachi_balance_after = float(hb_bal.get("available", 0))
+                self._current_cycle.hibachi_balance_after = self._parse_hb_balance(hb_bal)
                 self.state.standx_balance = self._current_cycle.standx_balance_after
                 self.state.hibachi_balance = self._current_cycle.hibachi_balance_after
                 self.state.weekly_hibachi_volume += self._current_cycle.notional
@@ -763,7 +771,7 @@ class DeltaNeutralBot:
                         sx_bal = await self.standx.get_balance()
                         hb_bal = await self.hibachi.get_balance()
                         self.state.standx_balance = self._parse_sx_balance(sx_bal)
-                        self.state.hibachi_balance = float(hb_bal.get("available", 0))
+                        self.state.hibachi_balance = self._parse_hb_balance(hb_bal)
                         self._consecutive_api_failures = 0
                         self._save_state()
                     except Exception as e:

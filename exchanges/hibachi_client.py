@@ -69,9 +69,18 @@ class HibachiClient:
         self._ensure_sdk()
         return await asyncio.to_thread(self._rest.get_stats, symbol)
 
-    async def _place_order_raw(self, **kwargs):
+    async def _place_order_raw(self, symbol: str, side: str, price: float,
+                               quantity: float, post_only: bool = False):
         self._ensure_sdk()
-        return await asyncio.to_thread(self._rest.place_limit_order, **kwargs)
+        from hibachi_xyz import Side, OrderFlags
+        sdk_side = Side.BUY if side.upper() == "BUY" else Side.SELL
+        flags = OrderFlags.PostOnly if post_only else None
+        return await asyncio.to_thread(
+            self._rest.place_limit_order,
+            symbol=symbol, quantity=quantity, price=price,
+            side=sdk_side, max_fees_percent=0.1,
+            order_flags=flags,
+        )
 
     async def _cancel_order_raw(self, order_id: str):
         self._ensure_sdk()
@@ -128,7 +137,7 @@ class HibachiClient:
                                 post_only: bool = False) -> dict:
         result = await _retry(
             self._place_order_raw,
-            symbol=symbol, side=side, price=price, size=size, post_only=post_only,
+            symbol=symbol, side=side, price=price, quantity=size, post_only=post_only,
         )
         if hasattr(result, "__dataclass_fields__"):
             from dataclasses import asdict
@@ -191,11 +200,20 @@ class HibachiWSClient:
                     except (ValueError, KeyError, TypeError):
                         pass
 
+                from hibachi_xyz import WebSocketSubscription, WebSocketSubscriptionTopic
                 ws.on("mark_price", _on_mark_price)
-                ws.subscribe("MARK_PRICE", symbols=[self.symbol])
-                logger.info("Hibachi WS connected: %s", self.symbol)
+                logger.info("Hibachi WS connecting: %s", self.symbol)
                 retry_delay = 1
-                await asyncio.to_thread(ws.start)
+                # connect → subscribe → 블로킹 대기
+                await ws.connect()
+                await ws.subscribe([WebSocketSubscription(
+                    symbol=self.symbol,
+                    topic=WebSocketSubscriptionTopic.MARK_PRICE,
+                )])
+                logger.info("Hibachi WS subscribed: %s", self.symbol)
+                # WS는 이벤트 콜백으로 데이터 수신, 여기서 대기
+                while self._running:
+                    await asyncio.sleep(5)
             except Exception as e:
                 if not self._running:
                     break
@@ -207,10 +225,7 @@ class HibachiWSClient:
         self._running = False
         if self._ws_instance is not None:
             try:
-                if hasattr(self._ws_instance, "stop"):
-                    self._ws_instance.stop()
-                elif hasattr(self._ws_instance, "close"):
-                    self._ws_instance.close()
+                await self._ws_instance.disconnect()
             except Exception:
                 pass
             self._ws_instance = None
