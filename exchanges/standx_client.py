@@ -170,7 +170,7 @@ class StandXClient:
 
     async def close_position(self, symbol: str, side: str, quantity: float,
                              slippage_pct: float = 0.005) -> dict:
-        """포지션 청산. slippage_pct: 기본 0.5% (I2: 0.1%→0.5% 확대)"""
+        """포지션 청산. slippage_pct: 기본 0.5%"""
         close_side = "SELL" if side == "BUY" else "BUY"
         market = await self.get_market_price(symbol)
         price = float(market.get("mark_price", 0))
@@ -178,7 +178,9 @@ class StandXClient:
             price *= (1 + slippage_pct)
         else:
             price *= (1 - slippage_pct)
-        return await self.place_limit_order(symbol, close_side, round(price, 2), quantity)
+        # ETH-USD tick size = 0.1
+        price = round(price / 0.1) * 0.1
+        return await self.place_limit_order(symbol, close_side, round(price, 1), quantity)
 
     async def change_leverage(self, symbol: str, leverage: int) -> dict:
         body = {"symbol": symbol, "leverage": leverage}

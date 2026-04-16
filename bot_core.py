@@ -178,9 +178,13 @@ class DeltaNeutralBot:
 
             # NEW-1: 진입 슬리피지 0.2% 적용 (체결률 향상)
             if standx_side == "BUY":
-                sx_order_price = round(sx_price * 1.002, 2)
+                sx_order_price = sx_price * 1.002
             else:
-                sx_order_price = round(sx_price * 0.998, 2)
+                sx_order_price = sx_price * 0.998
+            # StandX ETH-USD tick = 0.1
+            sx_order_price = round(sx_order_price / 0.1) * 0.1
+            sx_order_price = round(sx_order_price, 1)
+
             if hibachi_side == "BUY":
                 hb_order_price = round(hb_price * 1.002, 2)
             else:
@@ -189,7 +193,7 @@ class DeltaNeutralBot:
             # RC-3: 주문 응답 검증 — 거부 시 즉시 재시도
             try:
                 sx_resp = await self.standx.place_limit_order(
-                    Config.PAIR_STANDX, standx_side, sx_order_price, round(sx_quantity, 4)
+                    Config.PAIR_STANDX, standx_side, sx_order_price, round(sx_quantity, 3)
                 )
                 hb_resp = await self.hibachi.place_limit_order(
                     Config.PAIR_HIBACHI, hibachi_side, hb_order_price, round(hb_quantity, 6)
@@ -244,7 +248,7 @@ class DeltaNeutralBot:
             if has_standx and not has_hibachi:
                 logger.warning("편측 체결: StandX만 (시도 %d/%d)", attempt + 1, ENTRY_MAX_RETRIES)
                 await self.standx.close_position(
-                    Config.PAIR_STANDX, standx_side, round(sx_quantity, 4), slippage_pct=0.01
+                    Config.PAIR_STANDX, standx_side, round(sx_quantity, 3), slippage_pct=0.01
                 )
                 await asyncio.sleep(5)
                 # 해제 검증
@@ -288,11 +292,11 @@ class DeltaNeutralBot:
             sx_positions = await self.standx.get_positions()
             for p in sx_positions:
                 if p.get("symbol") == Config.PAIR_STANDX:
-                    actual_sizes["standx"] = abs(float(p.get("position_size", p.get("size", 0))))
+                    actual_sizes["standx"] = abs(float(p.get("qty", p.get("position_size", p.get("size", 0)))))
             hb_positions = await self.hibachi.get_positions()
             for p in hb_positions:
                 if p.get("symbol") == Config.PAIR_HIBACHI:
-                    actual_sizes["hibachi"] = abs(float(p.get("size", p.get("position_size", 0))))
+                    actual_sizes["hibachi"] = abs(float(p.get("quantity", p.get("size", p.get("position_size", 0)))))
         except Exception as e:
             logger.warning("청산 전 포지션 조회 실패, 저장값 사용: %s", e)
 
@@ -303,7 +307,7 @@ class DeltaNeutralBot:
                 if pos.exchange == "standx":
                     side = "BUY" if pos.side == "LONG" else "SELL"
                     await self.standx.close_position(
-                        Config.PAIR_STANDX, side, round(quantity, 4), slippage_pct=0.005
+                        Config.PAIR_STANDX, side, round(quantity, 3), slippage_pct=0.005
                     )
                 else:
                     side = "BUY" if pos.side == "LONG" else "SELL"
@@ -579,15 +583,17 @@ class DeltaNeutralBot:
             logger.info("양쪽 포지션 감지 → HOLD 복구")
 
             # C6: Position 객체 재구성
-            sx_size = abs(float(sx_pos.get("position_size", sx_pos.get("size", 0))))
+            # StandX: qty 양수=LONG, 음수=SHORT
+            sx_qty_raw = float(sx_pos.get("qty", sx_pos.get("position_size", sx_pos.get("size", 0))))
+            sx_size = abs(sx_qty_raw)
             sx_entry = float(sx_pos.get("entry_price", sx_pos.get("avg_price", 0)))
-            sx_side_raw = sx_pos.get("side", "").upper()
-            sx_side = "LONG" if sx_side_raw in ("LONG", "BUY") else "SHORT"
+            sx_side = "LONG" if sx_qty_raw > 0 else "SHORT"
             sx_notional = sx_size * sx_entry if sx_entry > 0 else 0
 
-            hb_size = abs(float(hb_pos.get("size", hb_pos.get("position_size", 0))))
-            hb_entry = float(hb_pos.get("entry_price", hb_pos.get("avg_price", 0)))
-            hb_side_raw = hb_pos.get("side", "").upper()
+            # Hibachi SDK 필드: quantity, openPrice, direction(Long/Short)
+            hb_size = abs(float(hb_pos.get("quantity", hb_pos.get("size", hb_pos.get("position_size", 0)))))
+            hb_entry = float(hb_pos.get("openPrice", hb_pos.get("entry_price", hb_pos.get("avg_price", 0))))
+            hb_side_raw = hb_pos.get("direction", hb_pos.get("side", "")).upper()
             hb_side = "LONG" if hb_side_raw in ("LONG", "BUY") else "SHORT"
             hb_notional = hb_size * hb_entry if hb_entry > 0 else 0
 
