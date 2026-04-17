@@ -140,10 +140,17 @@ class DeltaNeutralBot:
         return min(ratios) if ratios else 100.0
 
     async def _check_margin_safety(self) -> MarginLevel:
+        """델타 뉴트럴: 한 쪽 손실이 다른 쪽 이익으로 상쇄되므로
+        '실제로 청산 위험한 쪽(손실 쪽)이 거래소 유지마진에 가까워졌을 때'만 위험 판단.
+        """
         worst = MarginLevel.NORMAL
         for pos in self._positions.values():
             price = self.standx_price if pos.exchange == "standx" else self.hibachi_price
             if price <= 0:
+                continue
+            # 손실 중인 쪽만 체크 (이익 중인 쪽은 청산 위험 없음)
+            pnl = pos.calc_unrealized_pnl(price)
+            if pnl >= 0:
                 continue
             ratio = pos.calc_margin_ratio(price)
             level = check_margin_level(ratio, Config.MARGIN_WARNING_PCT, Config.MARGIN_EMERGENCY_PCT)
@@ -617,6 +624,15 @@ class DeltaNeutralBot:
             else:
                 self._cycle_entered_at = time.time()
 
+            # _current_cycle 재구성 (저장된 정보로)
+            direction_recovered = self.state.current_direction or "standx_short_hibachi_long"
+            self._current_cycle = Cycle(
+                cycle_id=self.state.current_cycle_id or 1,
+                direction=direction_recovered,
+                notional=notional,
+                entered_at=self._cycle_entered_at,
+            )
+
             await self.telegram.send_alert(
                 f"🔁 봇 재시작: 포지션 복구 완료\n"
                 f"StandX: {sx_side} ${notional:,.0f}\n"
@@ -704,6 +720,10 @@ class DeltaNeutralBot:
                 if not success:
                     await self.telegram.send_alert("🚨 Stop 청산 부분 실패! 수동 확인 필요!")
             self._save_state()
+            # Watchdog 영구 정지 (재시작 방지)
+            stop_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stop_bot")
+            with open(stop_file, "w") as f:
+                f.write(str(time.time()))
 
         from telegram_ui import BTN_STATUS, BTN_HISTORY, BTN_FUNDING, BTN_REBALANCE, BTN_STOP
         self.telegram.register_callback(BTN_STATUS, on_status)
@@ -828,13 +848,13 @@ class DeltaNeutralBot:
                             else:
                                 net_per_hour = hb_1h - sx_1h
 
-                            # 누적: 양수=비용, 음수=수익 → 수익이면 차감
+                            # 누적: 양수=비용, 음수=수익 (자연 누적, clamp 없음)
                             self._cumulative_funding_cost += net_per_hour
-                            if self._cumulative_funding_cost < 0:
-                                self._cumulative_funding_cost = 0.0
 
-                            # 달러 기반 누적 (일일 리포트용)
-                            notional = self._current_cycle.notional if self._current_cycle else 30000.0
+                            # 달러 기반 누적 (일일 리포트용): 음수 net_per_hour는 수익이므로 양수 누적
+                            notional = self._current_cycle.notional if self._current_cycle else (
+                                next(iter(self._positions.values())).notional if self._positions else 28500.0
+                            )
                             self.state.cumulative_funding += -net_per_hour * notional
 
                             # S5: 반대 방향이 현저히 유리하면 전환 트리거

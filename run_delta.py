@@ -20,9 +20,12 @@ CRASH_WINDOW = 300
 def main():
     crash_times = []
     restart_count = 0
+    proc = None
 
+    # .stop_bot 파일이 있으면 명시적 정지 상태 — 사용자가 수동 삭제해야 재시작
     if os.path.exists(STOP_FILE):
-        os.remove(STOP_FILE)
+        logger.info("⏹ .stop_bot 파일 존재 — 봇 시작 거부 (수동 삭제 필요)")
+        return
 
     logger.info("🚀 Delta Neutral Bot Watchdog 시작")
 
