@@ -160,10 +160,28 @@ class StandXClient:
         return resp.get("data", {})
 
     async def cancel_all_orders(self, symbol: str) -> dict:
-        """RI-7: 심볼 전체 미체결 주문 취소"""
-        body = {"symbol": symbol}
-        resp = await self._signed_request("POST", "/api/cancel_all_orders", body)
-        return resp.get("data", {})
+        """심볼 전체 미체결 주문 개별 취소 (StandX는 bulk cancel 엔드포인트 없음)"""
+        # 먼저 미체결 주문 목록 조회
+        try:
+            resp = await self._request("GET", "/api/query_open_orders", {"symbol": symbol})
+            orders = resp.get("data", [])
+            if not isinstance(orders, list):
+                return {"cancelled": 0}
+        except Exception as e:
+            logger.warning("StandX 미체결 주문 조회 실패: %s", e)
+            return {"cancelled": 0, "error": str(e)}
+
+        cancelled = 0
+        for order in orders:
+            order_id = order.get("id") or order.get("order_id")
+            if not order_id:
+                continue
+            try:
+                await self.cancel_order(str(order_id))
+                cancelled += 1
+            except Exception as e:
+                logger.warning("StandX 주문 취소 실패 %s: %s", order_id, e)
+        return {"cancelled": cancelled}
 
     async def close_position(self, symbol: str, side: str, quantity: float,
                              slippage_pct: float = 0.005) -> dict:
