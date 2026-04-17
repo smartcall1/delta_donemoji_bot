@@ -704,7 +704,10 @@ class DeltaNeutralBot:
             await self.telegram.send_alert("⏹ 봇 종료 중... 포지션 청산")
             self._running = False  # C7: 먼저 플래그 설정
             if self._positions:
-                await self._execute_exit()
+                success = await self._execute_exit()
+                if not success:
+                    await self.telegram.send_alert("🚨 Stop 청산 부분 실패! 수동 확인 필요!")
+            self._save_state()
 
         from telegram_ui import BTN_STATUS, BTN_HISTORY, BTN_FUNDING, BTN_REBALANCE, BTN_STOP
         self.telegram.register_callback(BTN_STATUS, on_status)

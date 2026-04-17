@@ -161,9 +161,12 @@ class HibachiClient:
             return self._to_dict(result)
         return {"raw": str(result)}
 
-    async def cancel_all_orders(self) -> dict:
+    async def _cancel_all_raw(self):
         self._ensure_sdk()
-        result = await asyncio.to_thread(self._rest.cancel_all_orders)
+        return await asyncio.to_thread(self._rest.cancel_all_orders)
+
+    async def cancel_all_orders(self) -> dict:
+        result = await _retry(self._cancel_all_raw)
         return {"raw": str(result)}
 
     async def close_position(self, symbol: str, side: str, size: float,

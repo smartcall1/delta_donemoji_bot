@@ -34,10 +34,6 @@ class StandXClient:
         if len(key_bytes) > 32:
             key_bytes = key_bytes[:32]
         self._signing_key = SigningKey(key_bytes)
-        # requestId = 공개키의 base58 인코딩
-        self._request_id = base58.b58encode(
-            self._signing_key.verify_key.encode()
-        ).decode()
         self._session: aiohttp.ClientSession | None = None
 
     async def _ensure_session(self):
@@ -144,7 +140,8 @@ class StandXClient:
         # qty=0인 빈 포지션 껍데기 필터링 (StandX가 레버리지 설정 시 자동 생성)
         return [p for p in raw if float(p.get("qty", 0)) != 0]
 
-    async def place_limit_order(self, symbol: str, side: str, price: float, quantity: float) -> dict:
+    async def place_limit_order(self, symbol: str, side: str, price: float, quantity: float,
+                               reduce_only: bool = False) -> dict:
         body = {
             "symbol": symbol,
             "side": side.lower(),
@@ -152,7 +149,7 @@ class StandXClient:
             "price": str(price),
             "qty": str(quantity),
             "time_in_force": "gtc",
-            "reduce_only": False,
+            "reduce_only": reduce_only,
         }
         resp = await self._signed_request("POST", "/api/new_order", body)
         return resp.get("data", {})
@@ -180,7 +177,8 @@ class StandXClient:
             price *= (1 - slippage_pct)
         # ETH-USD tick size = 0.1
         price = round(price / 0.1) * 0.1
-        return await self.place_limit_order(symbol, close_side, round(price, 1), quantity)
+        return await self.place_limit_order(symbol, close_side, round(price, 1), quantity,
+                                            reduce_only=True)
 
     async def change_leverage(self, symbol: str, leverage: int) -> dict:
         body = {"symbol": symbol, "leverage": leverage}
