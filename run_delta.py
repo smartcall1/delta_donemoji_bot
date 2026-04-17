@@ -1,20 +1,32 @@
-"""Watchdog 엔트리포인트 — 크래시 시 자동 재시작"""
+"""Watchdog 엔트리포인트 — 크래시 시 자동 재시작 + 로그 자동 저장"""
 import sys
 import subprocess
 import time
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("watchdog")
-
-BOT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_core.py")
-STOP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stop_bot")
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BOT_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "bot.log")
+STOP_FILE = os.path.join(BOT_DIR, ".stop_bot")
 MAX_CRASHES = 10
 CRASH_WINDOW = 300
+
+# 콘솔 + 파일 동시 출력 (10MB 단위 로테이션, 최대 5개 파일 = 50MB)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+file_handler.setFormatter(formatter)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+logger = logging.getLogger("watchdog")
 
 
 def main():
@@ -22,12 +34,11 @@ def main():
     restart_count = 0
     proc = None
 
-    # .stop_bot 파일이 있으면 명시적 정지 상태 — 사용자가 수동 삭제해야 재시작
     if os.path.exists(STOP_FILE):
         logger.info("⏹ .stop_bot 파일 존재 — 봇 시작 거부 (수동 삭제 필요)")
         return
 
-    logger.info("🚀 Delta Neutral Bot Watchdog 시작")
+    logger.info("🚀 Delta Neutral Bot Watchdog 시작 (로그: %s)", LOG_FILE)
 
     while True:
         if os.path.exists(STOP_FILE):
@@ -37,20 +48,33 @@ def main():
         restart_count += 1
         logger.info("봇 시작 (시도 #%d)", restart_count)
 
-        bot_dir = os.path.dirname(os.path.abspath(__file__))
         try:
-            proc = subprocess.Popen(
-                [sys.executable, "-c",
-                 f"import sys; sys.path.insert(0, r'{bot_dir}');"
-                 "import asyncio; from bot_core import DeltaNeutralBot; asyncio.run(DeltaNeutralBot().run())"],
-                stdout=sys.stdout,
-                stderr=sys.stderr,
-            )
-            exit_code = proc.wait()
+            # 자식 프로세스도 같은 로그 파일에 기록 (stdout 리디렉션)
+            with open(LOG_FILE, "a", encoding="utf-8") as log_fp:
+                proc = subprocess.Popen(
+                    [sys.executable, "-u", "-c",
+                     f"import sys; sys.path.insert(0, r'{BOT_DIR}');"
+                     "import asyncio; from bot_core import DeltaNeutralBot; asyncio.run(DeltaNeutralBot().run())"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=1,
+                    text=True,
+                )
+                # 자식 출력을 콘솔과 파일에 동시 기록
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    log_fp.write(line)
+                    log_fp.flush()
+                exit_code = proc.wait()
         except KeyboardInterrupt:
-            logger.info("Ctrl+C 감지, 종료")
+            logger.info("Ctrl+C 감지, 봇 종료 중...")
             if proc:
                 proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
             break
 
         if exit_code == 0:
