@@ -111,8 +111,8 @@ class DeltaNeutralBot:
 
     @staticmethod
     def _parse_sx_balance(bal: dict) -> float:
-        """StandX 잔액 파싱 — 응답 키 호환"""
-        for key in ("available_balance", "cross_available", "balance", "equity"):
+        """StandX 잔액 파싱 — equity(총 자산) 우선"""
+        for key in ("equity", "balance", "cross_balance", "cross_available"):
             if key in bal:
                 return float(bal[key])
         return 0.0
