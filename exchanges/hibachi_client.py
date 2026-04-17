@@ -130,15 +130,16 @@ class HibachiClient:
         return 0.0
 
     async def get_funding_rate(self, symbol: str) -> float:
-        result = await _retry(self._get_stats_raw, symbol)
-        # SDK StatsResponse: fundingRate 속성
-        if hasattr(result, "fundingRate"):
-            return float(result.fundingRate)
-        # PriceResponse의 fundingRateEstimation 내부
+        # 펀딩레이트는 get_prices의 fundingRateEstimation에 있음 (get_stats에는 없음!)
+        result = await _retry(self._get_prices_raw, symbol)
         if hasattr(result, "fundingRateEstimation"):
             est = result.fundingRateEstimation
-            if hasattr(est, "estimatedFundingRate"):
+            if hasattr(est, "estimatedFundingRate") and est.estimatedFundingRate:
                 return float(est.estimatedFundingRate)
+        # fallback: get_stats 시도
+        result = await _retry(self._get_stats_raw, symbol)
+        if hasattr(result, "fundingRate"):
+            return float(result.fundingRate)
         if isinstance(result, dict):
             return float(result.get("fundingRate", result.get("funding_rate", 0)))
         return 0.0
