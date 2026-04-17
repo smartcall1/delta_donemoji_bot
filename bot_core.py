@@ -183,19 +183,19 @@ class DeltaNeutralBot:
             sx_quantity = notional / sx_price
             hb_quantity = notional / hb_price
 
-            # NEW-1: 진입 슬리피지 0.2% 적용 (체결률 향상)
+            # 진입 슬리피지 0.4% (체결률 향상 — 0.2%는 30초 내 미체결 빈발)
             if standx_side == "BUY":
-                sx_order_price = sx_price * 1.002
+                sx_order_price = sx_price * 1.004
             else:
-                sx_order_price = sx_price * 0.998
+                sx_order_price = sx_price * 0.996
             # StandX ETH-USD tick = 0.1
             sx_order_price = round(sx_order_price / 0.1) * 0.1
             sx_order_price = round(sx_order_price, 1)
 
             if hibachi_side == "BUY":
-                hb_order_price = round(hb_price * 1.002, 2)
+                hb_order_price = round(hb_price * 1.004, 2)
             else:
-                hb_order_price = round(hb_price * 0.998, 2)
+                hb_order_price = round(hb_price * 0.996, 2)
 
             # RC-3: 주문 응답 검증 — 거부 시 즉시 재시도
             try:
