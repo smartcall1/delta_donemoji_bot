@@ -30,8 +30,9 @@ class Config:
     MAX_HOLD_DAYS: int = int(os.getenv("MAX_HOLD_DAYS", "4"))
     COOLDOWN_HOURS: int = int(os.getenv("COOLDOWN_HOURS", "3"))
     FUNDING_COST_THRESHOLD: float = float(os.getenv("FUNDING_COST_THRESHOLD", "0.001"))
-    MARGIN_WARNING_PCT: float = float(os.getenv("MARGIN_WARNING_PCT", "50"))
-    MARGIN_EMERGENCY_PCT: float = float(os.getenv("MARGIN_EMERGENCY_PCT", "33"))
+    # 3x 레버리지 기준: 시작 33%, 청산 ~5% (Hibachi 4.67%, StandX 1.25%)
+    MARGIN_WARNING_PCT: float = float(os.getenv("MARGIN_WARNING_PCT", "15"))
+    MARGIN_EMERGENCY_PCT: float = float(os.getenv("MARGIN_EMERGENCY_PCT", "10"))
 
     STANDX_MAINTENANCE_MARGIN: float = 0.0125
     HIBACHI_MAINTENANCE_MARGIN: float = 0.0467

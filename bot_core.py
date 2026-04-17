@@ -503,7 +503,7 @@ class DeltaNeutralBot:
                 return
 
             if margin_level == MarginLevel.WARNING:
-                if time.time() - self._last_warning_time > 300:
+                if time.time() - self._last_warning_time > 1800:  # 30분 쿨다운
                     self._last_warning_time = time.time()
                     worst = self._get_worst_margin()
                     await self.telegram.send_alert(f"⚠️ 마진율 경고: {worst:.1f}%")
