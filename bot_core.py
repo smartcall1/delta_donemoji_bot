@@ -198,11 +198,7 @@ class DeltaNeutralBot:
                 hb_resp = await self.hibachi.place_limit_order(
                     Config.PAIR_HIBACHI, hibachi_side, hb_order_price, round(hb_quantity, 6)
                 )
-                # 응답에 에러 코드가 있으면 체결 불가
-                if not sx_resp or not hb_resp:
-                    logger.warning("주문 응답 비어있음 (시도 %d/%d)", attempt + 1, ENTRY_MAX_RETRIES)
-                    await asyncio.sleep(5)
-                    continue
+                # 예외 없이 통과 = 주문 제출 성공 (응답이 빈 dict일 수 있음 — 정상)
             except Exception as e:
                 logger.error("주문 제출 실패 (시도 %d/%d): %s", attempt + 1, ENTRY_MAX_RETRIES, e)
                 await self.telegram.send_alert(f"⚠️ 주문 제출 실패 (시도 {attempt + 1}/{ENTRY_MAX_RETRIES}): {e}")
