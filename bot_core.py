@@ -729,13 +729,13 @@ class DeltaNeutralBot:
 
         await self._recovery_check()
 
-        ws_tasks = [
-            asyncio.create_task(self.standx_ws.connect()),
-            asyncio.create_task(self.hibachi_ws.connect()),
-        ]
+        # WS 비활성화 — 양쪽 SDK WS 모두 불안정 (ping timeout, SDK 내부 에러)
+        # REST 폴링으로 충분 (5초 간격)
+        ws_tasks = []
 
         last_balance_check = 0
         last_funding_check = 0
+        last_price_check = 0
 
         try:
             while self._running:
@@ -747,8 +747,9 @@ class DeltaNeutralBot:
                 if not self._running:
                     break
 
-                # REST fallback: 가격 (WS 미수신 시)
-                if self.standx_price == 0 or self.hibachi_price == 0:
+                # REST 가격 폴링 (5초마다)
+                if now - last_price_check > 5:
+                    last_price_check = now
                     try:
                         sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
                         self.standx_price = float(sx_market.get("mark_price", 0))
@@ -856,10 +857,6 @@ class DeltaNeutralBot:
                 await asyncio.sleep(5)
 
         finally:
-            await self.standx_ws.disconnect()
-            await self.hibachi_ws.disconnect()
             await self.standx.close()
             await self.hibachi.close()
             await self.telegram.close()
-            for t in ws_tasks:
-                t.cancel()

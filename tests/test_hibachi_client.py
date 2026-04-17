@@ -44,11 +44,13 @@ async def test_get_mark_price(client):
 
 @pytest.mark.asyncio
 async def test_get_funding_rate(client):
-    mock_stats = MagicMock()
-    mock_stats.fundingRate = "0.0002"
-    with patch.object(client, "_get_stats_raw", new_callable=AsyncMock, return_value=mock_stats):
+    mock_prices = MagicMock()
+    mock_est = MagicMock()
+    mock_est.estimatedFundingRate = "0.000031"
+    mock_prices.fundingRateEstimation = mock_est
+    with patch.object(client, "_get_prices_raw", new_callable=AsyncMock, return_value=mock_prices):
         rate = await client.get_funding_rate("ETH/USDT-P")
-        assert rate == 0.0002
+        assert rate == 0.000031
 
 
 @pytest.mark.asyncio
