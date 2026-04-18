@@ -692,54 +692,78 @@ class DeltaNeutralBot:
 
             # 활성 포지션: 방향·포지션·사이클 손익
             if self._positions:
+                sx_pos = self._positions.get("standx")
+                hb_pos = self._positions.get("hibachi")
+
+                # 방향 — state.current_direction 우선, 빈 값이면 Position.side로 폴백
                 direction = self.state.current_direction or ""
+                if not direction and sx_pos and hb_pos:
+                    direction = (
+                        "standx_long_hibachi_short"
+                        if sx_pos.side == "LONG" else "standx_short_hibachi_long"
+                    )
                 if "standx_long" in direction:
                     lines.append("방향: StandX 🟢LONG | Hibachi 🔴SHORT")
                 elif "standx_short" in direction:
                     lines.append("방향: StandX 🔴SHORT | Hibachi 🟢LONG")
 
+                # 편측 포지션 감지 — 양쪽 모두 있어야 정상
+                if (sx_pos and not hb_pos) or (hb_pos and not sx_pos):
+                    lines.append("⚠️ 편측 포지션 감지! 수동 확인 필요")
+
                 lines.append("")
                 lines.append("━━ 포지션 ━━")
 
-                sx_pos = self._positions.get("standx")
-                hb_pos = self._positions.get("hibachi")
                 sx_pnl = hb_pnl = 0.0
+                sx_price_ok = hb_price_ok = False
 
                 if sx_pos:
-                    sx_price = self.standx_price if self.standx_price > 0 else sx_pos.entry_price
-                    sx_pnl = sx_pos.calc_unrealized_pnl(sx_price)
-                    sx_margin = sx_pos.calc_margin_ratio(sx_price)
+                    sx_price_ok = self.standx_price > 0
                     lines.append(
                         f"StandX ({sx_pos.side}): ${sx_pos.notional:,.0f} "
                         f"@ ${sx_pos.entry_price:,.2f}"
                     )
-                    lines.append(
-                        f"  잔액 ${self.state.standx_balance:,.2f} | "
-                        f"현재 ${sx_price:,.2f}"
-                    )
-                    lines.append(
-                        f"  미실현 PnL: ${sx_pnl:+,.2f} | 마진: {sx_margin:.1f}%"
-                    )
+                    if sx_price_ok:
+                        sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
+                        sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
+                        lines.append(
+                            f"  잔액 ${self.state.standx_balance:,.2f} | "
+                            f"현재 ${self.standx_price:,.2f}"
+                        )
+                        lines.append(
+                            f"  미실현 PnL: ${sx_pnl:+,.2f} | 마진: {sx_margin:.1f}%"
+                        )
+                    else:
+                        lines.append(
+                            f"  잔액 ${self.state.standx_balance:,.2f} | 가격 로딩중…"
+                        )
 
                 if hb_pos:
-                    hb_price = self.hibachi_price if self.hibachi_price > 0 else hb_pos.entry_price
-                    hb_pnl = hb_pos.calc_unrealized_pnl(hb_price)
-                    hb_margin = hb_pos.calc_margin_ratio(hb_price)
+                    hb_price_ok = self.hibachi_price > 0
                     lines.append(
                         f"Hibachi ({hb_pos.side}): ${hb_pos.notional:,.0f} "
                         f"@ ${hb_pos.entry_price:,.2f}"
                     )
-                    lines.append(
-                        f"  잔액 ${self.state.hibachi_balance:,.2f} | "
-                        f"현재 ${hb_price:,.2f}"
-                    )
-                    lines.append(
-                        f"  미실현 PnL: ${hb_pnl:+,.2f} | 마진: {hb_margin:.1f}%"
-                    )
+                    if hb_price_ok:
+                        hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
+                        hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
+                        lines.append(
+                            f"  잔액 ${self.state.hibachi_balance:,.2f} | "
+                            f"현재 ${self.hibachi_price:,.2f}"
+                        )
+                        lines.append(
+                            f"  미실현 PnL: ${hb_pnl:+,.2f} | 마진: {hb_margin:.1f}%"
+                        )
+                    else:
+                        lines.append(
+                            f"  잔액 ${self.state.hibachi_balance:,.2f} | 가격 로딩중…"
+                        )
 
-                # 델타 뉴트럴 유지도 확인 (양쪽 PnL 합)
-                if sx_pos and hb_pos:
+                # 델타 뉴트럴 유지도 + 총 포트폴리오
+                if sx_pos and hb_pos and sx_price_ok and hb_price_ok:
                     lines.append(f"  델타 순합: ${sx_pnl + hb_pnl:+,.2f} (목표 ≈0)")
+                total = self.state.standx_balance + self.state.hibachi_balance
+                lines.append(f"  💼 총 포트폴리오: ${total:,.2f}")
 
                 # 사이클 손익 (현재 사이클 한정)
                 notional = (sx_pos.notional if sx_pos else
@@ -754,8 +778,11 @@ class DeltaNeutralBot:
                         f"(rate {self._cumulative_funding_cost:+.6f} / "
                         f"청산 임계 {Config.FUNDING_COST_THRESHOLD})"
                     )
-                    cycle_fee = notional * 0.0001  # 진입 수수료 (청산 시 동일분 추가 예정)
-                    lines.append(f"진입 수수료: -${cycle_fee:,.4f}")
+                    cycle_fee = notional * 0.0001  # 진입 수수료 (이미 누적에 반영)
+                    lines.append(
+                        f"진입 수수료(누적반영분): -${cycle_fee:,.4f} "
+                        f"(청산 시 동일분 추가)"
+                    )
             else:
                 # IDLE / COOLDOWN / ANALYZE — 포지션 없음
                 lines.append("")
@@ -768,7 +795,7 @@ class DeltaNeutralBot:
                     f"(ETH ${self.hibachi_price:,.2f})"
                 )
                 total = self.state.standx_balance + self.state.hibachi_balance
-                lines.append(f"총 잔액: ${total:,.2f}")
+                lines.append(f"💼 총 포트폴리오: ${total:,.2f}")
 
             # 누적 지표 (전 사이클 통합)
             lines.append("")
