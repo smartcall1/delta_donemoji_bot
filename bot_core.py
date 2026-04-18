@@ -83,6 +83,7 @@ class DeltaNeutralBot:
         self._running = False
         self._last_warning_time: float = 0.0
         self._last_daily_report: float = 0.0
+        self._last_hold_log: float = 0.0  # HOLD 상태 주기적 로깅 (30분)
         self._consecutive_api_failures: int = 0  # S3: 연속 API 실패 추적
 
     def _load_state(self) -> BotState:
@@ -466,6 +467,7 @@ class DeltaNeutralBot:
                 if success:
                     self._cycle_entered_at = time.time()
                     self._cumulative_funding_cost = 0.0
+                    self._last_hold_log = 0.0  # 새 사이클 즉시 HOLD 로그
                     self._current_cycle = Cycle(
                         cycle_id=self.state.current_cycle_id,
                         direction=direction,
@@ -516,6 +518,18 @@ class DeltaNeutralBot:
                     await self.telegram.send_alert(f"⚠️ 마진율 경고: {worst:.1f}%")
 
             worst_margin = self._get_worst_margin()
+
+            # HOLD 상태 주기 로깅 (30분마다)
+            now = time.time()
+            if now - self._last_hold_log > 1800:
+                self._last_hold_log = now
+                logger.info(
+                    "HOLD 상태: 보유=%.1fh, 마진=%.1f%%, 펀딩비용=%.6f, "
+                    "SX=$%.2f HB=$%.2f, 레벨=%s",
+                    hold_hours, worst_margin, self._cumulative_funding_cost,
+                    self.standx_price, self.hibachi_price, margin_level.name,
+                )
+
             if should_exit_cycle(
                 hold_hours=hold_hours,
                 min_hold_hours=Config.MIN_HOLD_HOURS,
@@ -525,6 +539,10 @@ class DeltaNeutralBot:
                 margin_emergency_pct=Config.MARGIN_EMERGENCY_PCT,
                 max_hold_days=Config.MAX_HOLD_DAYS,
             ):
+                logger.info(
+                    "EXIT 트리거: 보유=%.1fh, 펀딩비용=%.6f, 마진=%.1f%%",
+                    hold_hours, self._cumulative_funding_cost, worst_margin,
+                )
                 self.state.cycle_state = CycleState.EXIT
                 self._save_state()
 
@@ -767,15 +785,18 @@ class DeltaNeutralBot:
                 if not self._running:
                     break
 
-                # REST 가격 폴링 (5초마다)
+                # REST 가격 폴링 (5초마다) — 양쪽 독립 처리
                 if now - last_price_check > 5:
                     last_price_check = now
                     try:
                         sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
                         self.standx_price = float(sx_market.get("mark_price", 0))
+                    except Exception as e:
+                        logger.warning("StandX 가격 폴링 실패: %s", e)
+                    try:
                         self.hibachi_price = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Hibachi 가격 폴링 실패: %s", e)
 
                 await self._run_state_machine()
 

@@ -63,6 +63,8 @@ class StandXClient:
                     data = await resp.json()
                     if resp.status != 200:
                         logger.error("StandX API error: %s %s → %d %s", method, path, resp.status, data)
+                    else:
+                        logger.debug("StandX API: %s %s → 200", method, path)
                     # 응답이 {"code":0,"data":...} 형식이면 감싸고, 아니면 그대로 반환
                     if isinstance(data, dict) and "code" in data:
                         return data
