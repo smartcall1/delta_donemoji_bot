@@ -355,6 +355,53 @@ class DeltaNeutralBot:
         with open(path, "a") as f:
             f.write(cycle.to_jsonl() + "\n")
 
+    def _log_spread_snapshot(self, hold_hours: float):
+        """HOLD 틱마다 스프레드/델타순합 기록 — 기회적 청산 threshold 분포 분석용."""
+        sx_pos = self._positions.get("standx")
+        hb_pos = self._positions.get("hibachi")
+        if not sx_pos or not hb_pos:
+            return
+        if self.standx_price <= 0 or self.hibachi_price <= 0:
+            return
+
+        sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
+        hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
+        delta_sum = sx_pnl + hb_pnl
+
+        # 두 거래소 간 가격 스프레드 (LONG exchange − SHORT exchange 방향 고정)
+        if sx_pos.side == "LONG":
+            long_entry, short_entry = sx_pos.entry_price, hb_pos.entry_price
+            long_now, short_now = self.standx_price, self.hibachi_price
+        else:
+            long_entry, short_entry = hb_pos.entry_price, sx_pos.entry_price
+            long_now, short_now = self.hibachi_price, self.standx_price
+
+        spread_entry = long_entry - short_entry
+        spread_now = long_now - short_now
+
+        record = {
+            "ts": time.time(),
+            "cycle_id": self.state.current_cycle_id,
+            "hold_h": round(hold_hours, 4),
+            "sx_px": self.standx_price,
+            "hb_px": self.hibachi_price,
+            "sx_entry": sx_pos.entry_price,
+            "hb_entry": hb_pos.entry_price,
+            "sx_pnl": round(sx_pnl, 4),
+            "hb_pnl": round(hb_pnl, 4),
+            "delta_sum": round(delta_sum, 4),
+            "spread_now": round(spread_now, 4),
+            "spread_entry": round(spread_entry, 4),
+            "spread_delta": round(spread_now - spread_entry, 4),
+            "funding_cost": round(self._cumulative_funding_cost, 8),
+        }
+        path = os.path.join(Config.LOG_DIR, "spread_history.jsonl")
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning("spread 로깅 실패: %s", e)
+
     def _check_weekly_reset(self):
         """M5: 매주 월요일 00:00 UTC에 주간 거래량 리셋"""
         now = time.time()
@@ -518,6 +565,9 @@ class DeltaNeutralBot:
                     await self.telegram.send_alert(f"⚠️ 마진율 경고: {worst:.1f}%")
 
             worst_margin = self._get_worst_margin()
+
+            # 스프레드 분포 기록 (매 틱, spread_history.jsonl)
+            self._log_spread_snapshot(hold_hours)
 
             # HOLD 상태 주기 로깅 (30분마다)
             now = time.time()
