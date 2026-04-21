@@ -154,7 +154,12 @@ class StandXClient:
             "reduce_only": reduce_only,
         }
         resp = await self._signed_request("POST", "/api/new_order", body)
-        return resp.get("data", {})
+        code = resp.get("code")
+        if code is not None and code != 0:
+            logger.error("StandX 주문 거부: code=%s msg=%s body=%s", code, resp.get("message"), body)
+            raise Exception(f"StandX order rejected: code={code} msg={resp.get('message')}")
+        logger.info("StandX 주문 제출: %s %s qty=%s price=%s → %s", side, symbol, quantity, price, resp.get("message", resp))
+        return resp
 
     async def cancel_order(self, order_id: str) -> dict:
         body = {"order_id": order_id}
