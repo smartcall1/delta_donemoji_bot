@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 ENTRY_MAX_RETRIES = 3
 ENTRY_CHUNKS = 5
+EXIT_CHUNKS = 5
 CHUNK_RETRY = 2
 API_FAIL_EMERGENCY_THRESHOLD = 10  # S3: 연속 REST 실패 횟수 → 긴급 청산
 
@@ -291,11 +292,7 @@ class DeltaNeutralBot:
         return True
 
     async def _execute_exit(self) -> bool:
-        """양쪽 동시 청산 — RC-5: 실제 포지션 수량 + NEW-4: 청산 검증"""
-        failed = []
-        succeeded = []
-
-        # RC-5: 실제 포지션 크기를 거래소에서 조회
+        """양쪽 분할 청산 — RC-5: 실제 포지션 수량 기준, 청크별 양쪽 동시 청산"""
         actual_sizes = {}
         try:
             sx_positions = await self.standx.get_positions()
@@ -309,50 +306,121 @@ class DeltaNeutralBot:
         except Exception as e:
             logger.warning("청산 전 포지션 조회 실패, 저장값 사용: %s", e)
 
-        for key, pos in list(self._positions.items()):
-            try:
-                # RC-5: 실제 수량 우선, 없으면 계산값 사용
-                quantity = actual_sizes.get(key, pos.notional / pos.entry_price)
-                if pos.exchange == "standx":
-                    side = "BUY" if pos.side == "LONG" else "SELL"
-                    await self.standx.close_position(
-                        Config.PAIR_STANDX, side, round(quantity, 3), slippage_pct=0.005
-                    )
-                else:
-                    side = "BUY" if pos.side == "LONG" else "SELL"
-                    await self.hibachi.close_position(
-                        Config.PAIR_HIBACHI, side, round(quantity, 6), slippage_pct=0.005
-                    )
-                succeeded.append(key)
-            except Exception as e:
-                logger.error("%s 청산 실패: %s", key, e)
-                await self.telegram.send_alert(f"🚨 {key} 청산 실패: {e}\n수동 확인 필요!")
-                failed.append(key)
-
-        # NEW-4: 청산 검증 — 실제로 닫혔는지 확인
-        if succeeded:
-            await asyncio.sleep(5)
-            sx_positions = await self.standx.get_positions()
-            hb_positions = await self.hibachi.get_positions()
-            sx_still = any(p.get("symbol") == Config.PAIR_STANDX for p in sx_positions)
-            hb_still = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hb_positions)
-
-            if "standx" in succeeded and sx_still:
-                logger.error("StandX 청산 주문 제출됐으나 포지션 여전히 존재")
-                succeeded.remove("standx")
-                failed.append("standx")
-            if "hibachi" in succeeded and hb_still:
-                logger.error("Hibachi 청산 주문 제출됐으나 포지션 여전히 존재")
-                succeeded.remove("hibachi")
-                failed.append("hibachi")
-
-        # C2: 확인된 것만 제거
-        for key in succeeded:
-            del self._positions[key]
-
-        if failed:
-            logger.error("부분 청산 실패: %s — 재시도 대기", failed)
+        sx_pos = self._positions.get("standx")
+        hb_pos = self._positions.get("hibachi")
+        if not sx_pos or not hb_pos:
+            logger.error("청산 대상 포지션 없음")
             return False
+
+        sx_total = actual_sizes.get("standx", sx_pos.notional / sx_pos.entry_price)
+        hb_total = actual_sizes.get("hibachi", hb_pos.notional / hb_pos.entry_price)
+        sx_side = "BUY" if sx_pos.side == "LONG" else "SELL"
+        hb_side = "BUY" if hb_pos.side == "LONG" else "SELL"
+
+        sx_chunk = sx_total / EXIT_CHUNKS
+        hb_chunk = hb_total / EXIT_CHUNKS
+        closed_chunks = 0
+
+        await self.telegram.send_alert(
+            f"📦 분할 청산 시작: {EXIT_CHUNKS}청크 (StandX {sx_total:.3f} / Hibachi {hb_total:.6f})"
+        )
+
+        for chunk_idx in range(EXIT_CHUNKS):
+            is_last = (chunk_idx == EXIT_CHUNKS - 1)
+            sx_qty = round(sx_total - sx_chunk * chunk_idx, 3) if is_last else round(sx_chunk, 3)
+            hb_qty = round(hb_total - hb_chunk * chunk_idx, 6) if is_last else round(hb_chunk, 6)
+
+            chunk_ok = False
+            for retry in range(CHUNK_RETRY):
+                try:
+                    await self.standx.close_position(
+                        Config.PAIR_STANDX, sx_side, sx_qty, slippage_pct=0.005
+                    )
+                    await self.hibachi.close_position(
+                        Config.PAIR_HIBACHI, hb_side, hb_qty, slippage_pct=0.005
+                    )
+                except Exception as e:
+                    logger.error("청산 주문 실패 (청크 %d 시도 %d): %s", chunk_idx + 1, retry + 1, e)
+                    await asyncio.sleep(5)
+                    continue
+
+                await asyncio.sleep(30)
+
+                sx_remaining = await self.standx.get_positions()
+                hb_remaining = await self.hibachi.get_positions()
+                sx_still = any(p.get("symbol") == Config.PAIR_STANDX for p in sx_remaining)
+                hb_still = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hb_remaining)
+
+                if not sx_still and not hb_still:
+                    logger.info("청크 %d/%d 청산 완료 (포지션 전량 소멸)", chunk_idx + 1, EXIT_CHUNKS)
+                    closed_chunks = EXIT_CHUNKS
+                    chunk_ok = True
+                    break
+
+                # 미체결 주문 정리
+                try:
+                    await self.standx.cancel_all_orders(Config.PAIR_STANDX)
+                except Exception:
+                    pass
+                try:
+                    await self.hibachi.cancel_all_orders()
+                except Exception:
+                    pass
+
+                sx_now = 0.0
+                for p in sx_remaining:
+                    if p.get("symbol") == Config.PAIR_STANDX:
+                        sx_now = abs(float(p.get("qty", 0)))
+                hb_now = 0.0
+                for p in hb_remaining:
+                    if p.get("symbol") == Config.PAIR_HIBACHI:
+                        hb_now = abs(float(p.get("quantity", p.get("size", 0))))
+
+                sx_closed = sx_total - sx_now < sx_chunk * (chunk_idx + 0.5)
+                hb_closed = hb_total - hb_now < hb_chunk * (chunk_idx + 0.5)
+
+                if not sx_closed or not hb_closed:
+                    logger.warning("청크 %d 미체결 (시도 %d) sx잔량=%.3f hb잔량=%.6f",
+                                   chunk_idx + 1, retry + 1, sx_now, hb_now)
+                    await asyncio.sleep(3)
+                    continue
+
+                logger.info("청크 %d/%d 청산 완료 (sx잔량=%.3f hb잔량=%.6f)",
+                            chunk_idx + 1, EXIT_CHUNKS, sx_now, hb_now)
+                sx_total = sx_now
+                hb_total = hb_now
+                sx_chunk = sx_total / max(EXIT_CHUNKS - chunk_idx - 1, 1)
+                hb_chunk = hb_total / max(EXIT_CHUNKS - chunk_idx - 1, 1)
+                closed_chunks += 1
+                chunk_ok = True
+                break
+
+            if not chunk_ok:
+                logger.error("청크 %d 청산 실패, 분할 청산 중단", chunk_idx + 1)
+                await self.telegram.send_alert(
+                    f"🚨 분할 청산 중단 (청크 {chunk_idx + 1}/{EXIT_CHUNKS} 실패)\n수동 확인 필요!"
+                )
+                break
+
+            if closed_chunks >= EXIT_CHUNKS:
+                break
+
+        # 최종 검증
+        sx_positions = await self.standx.get_positions()
+        hb_positions = await self.hibachi.get_positions()
+        sx_still = any(p.get("symbol") == Config.PAIR_STANDX for p in sx_positions)
+        hb_still = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hb_positions)
+
+        if not sx_still:
+            del self._positions["standx"]
+        if not hb_still:
+            del self._positions["hibachi"]
+
+        if sx_still or hb_still:
+            logger.error("분할 청산 후 잔여 포���션: sx=%s hb=%s", sx_still, hb_still)
+            return False
+
+        await self.telegram.send_alert(f"✅ 분할 청산 완료 ({closed_chunks}청크)")
         return True
 
     def _log_cycle(self, cycle: Cycle):
