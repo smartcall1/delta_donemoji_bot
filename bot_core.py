@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 ENTRY_MAX_RETRIES = 3
+ENTRY_CHUNKS = 5
+CHUNK_RETRY = 2
 API_FAIL_EMERGENCY_THRESHOLD = 10  # S3: 연속 REST 실패 횟수 → 긴급 청산
 
 
@@ -162,128 +164,131 @@ class DeltaNeutralBot:
         return worst
 
     async def _execute_enter(self, direction: str, notional: float) -> bool:
-        """양쪽 동시 진입 — C3: 개별 가격, S1: 3회 재시도"""
+        """양쪽 분할 진입 — 노셔널을 ENTRY_CHUNKS등분하여 순차 체결"""
         standx_side, hibachi_side = self._parse_direction(direction)
+        chunk_notional = notional / ENTRY_CHUNKS
+        filled_notional = 0.0
+        avg_sx_price = 0.0
+        avg_hb_price = 0.0
 
-        for attempt in range(ENTRY_MAX_RETRIES):
-            # C3: 양쪽 개별 가격 조회
-            try:
-                sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
-                sx_price = float(sx_market.get("mark_price", 0))
-                hb_price = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
-            except Exception as e:
-                logger.error("가격 조회 실패 (시도 %d/%d): %s", attempt + 1, ENTRY_MAX_RETRIES, e)
-                await asyncio.sleep(5)
-                continue
+        await self.telegram.send_alert(
+            f"📦 분할 진입 시작: ${notional:,.0f} ÷ {ENTRY_CHUNKS} = ${chunk_notional:,.0f}/청크"
+        )
 
-            if sx_price <= 0 or hb_price <= 0:
-                logger.error("가격 정보 없음 (sx=%.2f, hb=%.2f)", sx_price, hb_price)
-                await asyncio.sleep(5)
-                continue
+        for chunk_idx in range(ENTRY_CHUNKS):
+            chunk_filled = False
 
-            sx_quantity = notional / sx_price
-            hb_quantity = notional / hb_price
-
-            # 진입 슬리피지 0.4% (체결률 향상 — 0.2%는 30초 내 미체결 빈발)
-            if standx_side == "BUY":
-                sx_order_price = sx_price * 1.004
-            else:
-                sx_order_price = sx_price * 0.996
-            # StandX ETH-USD tick = 0.1
-            sx_order_price = round(sx_order_price / 0.1) * 0.1
-            sx_order_price = round(sx_order_price, 1)
-
-            if hibachi_side == "BUY":
-                hb_order_price = round(hb_price * 1.004, 2)
-            else:
-                hb_order_price = round(hb_price * 0.996, 2)
-
-            # RC-3: 주문 응답 검증 — 거부 시 즉시 재시도
-            try:
-                sx_resp = await self.standx.place_limit_order(
-                    Config.PAIR_STANDX, standx_side, sx_order_price, round(sx_quantity, 3)
-                )
-                hb_resp = await self.hibachi.place_limit_order(
-                    Config.PAIR_HIBACHI, hibachi_side, hb_order_price, round(hb_quantity, 6)
-                )
-                # 예외 없이 통과 = 주문 제출 성공 (응답이 빈 dict일 수 있음 — 정상)
-            except Exception as e:
-                logger.error("주문 제출 실패 (시도 %d/%d): %s", attempt + 1, ENTRY_MAX_RETRIES, e)
-                await self.telegram.send_alert(f"⚠️ 주문 제출 실패 (시도 {attempt + 1}/{ENTRY_MAX_RETRIES}): {e}")
-                await asyncio.sleep(5)
-                continue
-
-            await asyncio.sleep(30)
-
-            standx_positions = await self.standx.get_positions()
-            hibachi_positions = await self.hibachi.get_positions()
-            has_standx = any(p.get("symbol") == Config.PAIR_STANDX for p in standx_positions)
-            has_hibachi = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hibachi_positions)
-
-            if has_standx and has_hibachi:
-                margin = notional / Config.LEVERAGE
-                self._positions["standx"] = Position(
-                    exchange="standx", symbol=Config.PAIR_STANDX,
-                    side="LONG" if standx_side == "BUY" else "SHORT",
-                    notional=notional, entry_price=sx_price,
-                    leverage=Config.LEVERAGE, margin=margin,
-                )
-                self._positions["hibachi"] = Position(
-                    exchange="hibachi", symbol=Config.PAIR_HIBACHI,
-                    side="LONG" if hibachi_side == "BUY" else "SHORT",
-                    notional=notional, entry_price=hb_price,
-                    leverage=Config.LEVERAGE, margin=margin,
-                )
-                return True
-
-            # NEW-3+RI-7: 미체결 주문 취소 (유령 주문 방지)
-            if not has_standx:
+            for retry in range(CHUNK_RETRY):
                 try:
-                    await self.standx.cancel_all_orders(Config.PAIR_STANDX)
-                except Exception:
-                    pass
-            if not has_hibachi:
+                    sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
+                    sx_price = float(sx_market.get("mark_price", 0))
+                    hb_price = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
+                except Exception as e:
+                    logger.error("가격 조회 실패 (청크 %d 시도 %d): %s", chunk_idx + 1, retry + 1, e)
+                    await asyncio.sleep(5)
+                    continue
+
+                if sx_price <= 0 or hb_price <= 0:
+                    logger.error("가격 정보 없음 (sx=%.2f, hb=%.2f)", sx_price, hb_price)
+                    await asyncio.sleep(5)
+                    continue
+
+                sx_qty = chunk_notional / sx_price
+                hb_qty = chunk_notional / hb_price
+
+                if standx_side == "BUY":
+                    sx_order_price = sx_price * 1.004
+                else:
+                    sx_order_price = sx_price * 0.996
+                sx_order_price = round(sx_order_price / 0.1) * 0.1
+                sx_order_price = round(sx_order_price, 1)
+
+                if hibachi_side == "BUY":
+                    hb_order_price = round(hb_price * 1.004, 2)
+                else:
+                    hb_order_price = round(hb_price * 0.996, 2)
+
                 try:
-                    await self.hibachi.cancel_all_orders()
-                except Exception:
-                    pass
-
-            # C1: 편측 체결 — 공격적 슬리피지로 해제 + 검증
-            if has_standx and not has_hibachi:
-                logger.warning("편측 체결: StandX만 (시도 %d/%d)", attempt + 1, ENTRY_MAX_RETRIES)
-                await self.standx.close_position(
-                    Config.PAIR_STANDX, standx_side, round(sx_quantity, 3), slippage_pct=0.01
-                )
-                await asyncio.sleep(5)
-                # 해제 검증
-                remaining = await self.standx.get_positions()
-                still_open = any(p.get("symbol") == Config.PAIR_STANDX for p in remaining)
-                if still_open:
-                    await self.telegram.send_alert(
-                        "🚨 편측 해제 실패! StandX 포지션이 여전히 열려있음. 수동 확인 필요!"
+                    await self.standx.place_limit_order(
+                        Config.PAIR_STANDX, standx_side, sx_order_price, round(sx_qty, 3)
                     )
-                    return False
-                await self.telegram.send_alert(f"⚠️ 편측 체결 해제 완료 (시도 {attempt + 1})")
-
-            elif has_hibachi and not has_standx:
-                logger.warning("편측 체결: Hibachi만 (시도 %d/%d)", attempt + 1, ENTRY_MAX_RETRIES)
-                await self.hibachi.close_position(
-                    Config.PAIR_HIBACHI, hibachi_side, round(hb_quantity, 6), slippage_pct=0.01
-                )
-                await asyncio.sleep(5)
-                remaining = await self.hibachi.get_positions()
-                still_open = any(p.get("symbol") == Config.PAIR_HIBACHI for p in remaining)
-                if still_open:
-                    await self.telegram.send_alert(
-                        "🚨 편측 해제 실패! Hibachi 포지션이 여전히 열려있음. 수동 확인 필요!"
+                    await self.hibachi.place_limit_order(
+                        Config.PAIR_HIBACHI, hibachi_side, hb_order_price, round(hb_qty, 6)
                     )
-                    return False
-                await self.telegram.send_alert(f"⚠️ 편측 체결 해제 완료 (시도 {attempt + 1})")
+                except Exception as e:
+                    logger.error("주문 제출 실패 (청크 %d 시도 %d): %s", chunk_idx + 1, retry + 1, e)
+                    await asyncio.sleep(5)
+                    continue
 
-            await asyncio.sleep(5)
+                await asyncio.sleep(30)
 
-        await self.telegram.send_alert(f"🚨 진입 {ENTRY_MAX_RETRIES}회 실패, IDLE 복귀")
-        return False
+                standx_positions = await self.standx.get_positions()
+                hibachi_positions = await self.hibachi.get_positions()
+                has_standx = any(p.get("symbol") == Config.PAIR_STANDX for p in standx_positions)
+                has_hibachi = any(p.get("symbol") == Config.PAIR_HIBACHI for p in hibachi_positions)
+
+                if has_standx and has_hibachi:
+                    filled_notional += chunk_notional
+                    avg_sx_price = (avg_sx_price * (filled_notional - chunk_notional) + sx_price * chunk_notional) / filled_notional if filled_notional > 0 else sx_price
+                    avg_hb_price = (avg_hb_price * (filled_notional - chunk_notional) + hb_price * chunk_notional) / filled_notional if filled_notional > 0 else hb_price
+                    logger.info("청크 %d/%d 체결 완료 (누적 $%.0f/$%.0f)", chunk_idx + 1, ENTRY_CHUNKS, filled_notional, notional)
+                    chunk_filled = True
+                    break
+
+                # 미체결 주문 취소
+                if not has_standx:
+                    try:
+                        await self.standx.cancel_all_orders(Config.PAIR_STANDX)
+                    except Exception:
+                        pass
+                if not has_hibachi:
+                    try:
+                        await self.hibachi.cancel_all_orders()
+                    except Exception:
+                        pass
+
+                # 편측 체결 롤백
+                if has_standx and not has_hibachi:
+                    logger.warning("편측 체결: StandX만 (청크 %d 시도 %d)", chunk_idx + 1, retry + 1)
+                    await self.standx.close_position(
+                        Config.PAIR_STANDX, standx_side, round(sx_qty, 3), slippage_pct=0.01
+                    )
+                    await asyncio.sleep(5)
+                elif has_hibachi and not has_standx:
+                    logger.warning("편측 체결: Hibachi만 (청크 %d 시도 %d)", chunk_idx + 1, retry + 1)
+                    await self.hibachi.close_position(
+                        Config.PAIR_HIBACHI, hibachi_side, round(hb_qty, 6), slippage_pct=0.01
+                    )
+                    await asyncio.sleep(5)
+
+                await asyncio.sleep(3)
+
+            if not chunk_filled:
+                logger.warning("청크 %d 실패, 분할 진입 중단 (누적 $%.0f)", chunk_idx + 1, filled_notional)
+                break
+
+        if filled_notional <= 0:
+            await self.telegram.send_alert(f"🚨 분할 진입 전부 실패, IDLE 복귀")
+            return False
+
+        margin = filled_notional / Config.LEVERAGE
+        self._positions["standx"] = Position(
+            exchange="standx", symbol=Config.PAIR_STANDX,
+            side="LONG" if standx_side == "BUY" else "SHORT",
+            notional=filled_notional, entry_price=avg_sx_price,
+            leverage=Config.LEVERAGE, margin=margin,
+        )
+        self._positions["hibachi"] = Position(
+            exchange="hibachi", symbol=Config.PAIR_HIBACHI,
+            side="LONG" if hibachi_side == "BUY" else "SHORT",
+            notional=filled_notional, entry_price=avg_hb_price,
+            leverage=Config.LEVERAGE, margin=margin,
+        )
+        await self.telegram.send_alert(
+            f"✅ 분할 진입 완료: ${filled_notional:,.0f}/${notional:,.0f} "
+            f"({ENTRY_CHUNKS}청크 중 {int(filled_notional / chunk_notional)}개 체결)"
+        )
+        return True
 
     async def _execute_exit(self) -> bool:
         """양쪽 동시 청산 — RC-5: 실제 포지션 수량 + NEW-4: 청산 검증"""
@@ -497,7 +502,8 @@ class DeltaNeutralBot:
 
                 notional = calc_notional(sx_available, hb_available, Config.LEVERAGE)
 
-                logger.info("분석 완료: 방향=%s, 노셔널=$%.2f", direction, notional)
+                logger.info("잔액: StandX=$%.2f, Hibachi=$%.2f → min=$%.2f", sx_available, hb_available, min(sx_available, hb_available))
+                logger.info("분석 완료: 방향=%s, 노셔널=$%.2f (min×%dx×0.95)", direction, notional, Config.LEVERAGE)
 
                 # C7: 진입 전 _running 재확인
                 if not self._running:
