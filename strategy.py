@@ -9,13 +9,18 @@ def normalize_funding_to_8h(rate: float, period_hours: int) -> float:
     return rate * (8 / period_hours)
 
 
-def decide_direction(standx_rate_8h: float, hibachi_rate_8h: float) -> str:
+def decide_direction(standx_rate_8h: float, hibachi_rate_8h: float) -> str | None:
     """양수 펀딩 = 롱이 숏에게 지불.
     옵션A: StandX Long + Hibachi Short → net = hibachi - standx
     옵션B: StandX Short + Hibachi Long → net = standx - hibachi
+    양쪽 모두 음수면 진입 보류 (None 반환).
     """
     option_a = hibachi_rate_8h - standx_rate_8h
     option_b = standx_rate_8h - hibachi_rate_8h
+    best = max(option_a, option_b)
+    if best <= 0:
+        logger.info("양쪽 순 펀딩 모두 음수 (A=%.6f, B=%.6f) → 진입 보류", option_a, option_b)
+        return None
     if option_a >= option_b:
         logger.info("방향: StandX LONG + Hibachi SHORT (net=%.6f)", option_a)
         return "standx_long_hibachi_short"
@@ -28,16 +33,18 @@ def should_exit_cycle(
     hold_hours: float, min_hold_hours: int, cumulative_funding_cost: float,
     funding_threshold: float, margin_ratio_min: float, margin_emergency_pct: float,
     max_hold_days: int,
-) -> bool:
-    if hold_hours < min_hold_hours:
-        return False
+) -> str | None:
+    """EXIT 사유를 문자열로 반환. None이면 EXIT 안 함.
+    마진 긴급은 MIN_HOLD 이전에도 발동."""
     if margin_ratio_min <= margin_emergency_pct:
-        return True
+        return "margin_emergency"
+    if hold_hours < min_hold_hours:
+        return None
     if cumulative_funding_cost > funding_threshold:
-        return True
+        return "funding_cost"
     if hold_hours > max_hold_days * 24:
-        return True
-    return False
+        return "max_hold"
+    return None
 
 
 def is_opposite_direction_better(
@@ -60,6 +67,15 @@ def is_opposite_direction_better(
     advantage = opposite_net - current_net
     if advantage > advantage_threshold:
         logger.info("반대 방향 유리: 현재=%.6f, 반대=%.6f, 차이=%.6f", current_net, opposite_net, advantage)
+        return True
+    return False
+
+
+def should_exit_spread(delta_sum: float, threshold: float) -> bool:
+    """스프레드 MTM이 threshold 이상이면 기회적 청산 트리거.
+    MIN_HOLD 무관 — 수익 조건만 판단."""
+    if delta_sum >= threshold:
+        logger.info("기회적 청산 트리거: delta_sum=$%.2f >= threshold=$%.0f", delta_sum, threshold)
         return True
     return False
 

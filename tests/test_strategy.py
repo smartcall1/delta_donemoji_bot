@@ -1,5 +1,5 @@
 import pytest
-from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional, is_opposite_direction_better
+from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional, is_opposite_direction_better, should_exit_spread
 
 
 class TestNormalizeFunding:
@@ -20,25 +20,44 @@ class TestDecideDirection:
     def test_standx_short_when_cheaper(self):
         assert decide_direction(0.010, 0.005) == "standx_short_hibachi_long"
 
-    def test_equal_rates_default(self):
-        assert decide_direction(0.005, 0.005) == "standx_long_hibachi_short"
+    def test_equal_rates_returns_none(self):
+        # 양쪽 net = 0 → 수익 없으므로 진입 보류
+        assert decide_direction(0.005, 0.005) is None
+
+    def test_both_negative_but_one_direction_profitable(self):
+        # sx=-0.003, hb=-0.005 → option_b = -0.003-(-0.005) = +0.002 (양수)
+        assert decide_direction(-0.003, -0.005) == "standx_short_hibachi_long"
+
+    def test_truly_unprofitable_returns_none(self):
+        # 양쪽 동일 음수 → 모든 방향 net=0
+        assert decide_direction(-0.005, -0.005) is None
+
+    def test_one_positive_enters(self):
+        assert decide_direction(-0.001, 0.003) == "standx_long_hibachi_short"
+
+    def test_both_zero_returns_none(self):
+        assert decide_direction(0.0, 0.0) is None
 
 
 class TestShouldExitCycle:
     def test_not_enough_hold_time(self):
-        assert should_exit_cycle(12, 24, 0.005, 0.001, 50.0, 33.0, 4) is False
+        assert should_exit_cycle(12, 24, 0.005, 0.001, 50.0, 33.0, 4) is None
 
     def test_exit_on_funding_cost(self):
-        assert should_exit_cycle(30, 24, 0.002, 0.001, 50.0, 33.0, 4) is True
+        assert should_exit_cycle(30, 24, 0.002, 0.001, 50.0, 33.0, 4) == "funding_cost"
 
     def test_exit_on_margin_danger(self):
-        assert should_exit_cycle(30, 24, 0.0, 0.001, 30.0, 33.0, 4) is True
+        assert should_exit_cycle(30, 24, 0.0, 0.001, 30.0, 33.0, 4) == "margin_emergency"
 
     def test_exit_on_max_hold(self):
-        assert should_exit_cycle(100, 24, 0.0, 0.001, 50.0, 33.0, 4) is True
+        assert should_exit_cycle(100, 24, 0.0, 0.001, 50.0, 33.0, 4) == "max_hold"
 
     def test_no_exit_when_healthy(self):
-        assert should_exit_cycle(30, 24, 0.0005, 0.001, 50.0, 33.0, 4) is False
+        assert should_exit_cycle(30, 24, 0.0005, 0.001, 50.0, 33.0, 4) is None
+
+    def test_margin_emergency_before_min_hold(self):
+        # 마진 긴급은 MIN_HOLD 이전에도 발동
+        assert should_exit_cycle(6, 24, 0.0, 0.001, 8.0, 10.0, 4) == "margin_emergency"
 
 
 class TestCalcNotional:
@@ -71,3 +90,17 @@ class TestIsOppositeDirectionBetter:
 
     def test_same_rates_no_switch(self):
         assert is_opposite_direction_better("standx_long_hibachi_short", 0.005, 0.005) is False
+
+
+class TestShouldExitSpread:
+    def test_above_threshold_triggers(self):
+        assert should_exit_spread(55.0, 50.0) is True
+
+    def test_below_threshold_no_trigger(self):
+        assert should_exit_spread(30.0, 50.0) is False
+
+    def test_exact_threshold_triggers(self):
+        assert should_exit_spread(50.0, 50.0) is True
+
+    def test_negative_delta_no_trigger(self):
+        assert should_exit_spread(-20.0, 50.0) is False

@@ -30,7 +30,7 @@ from config import Config
 from models import CycleState, BotState, Position, Cycle, FundingSnapshot
 from exchanges.standx_client import StandXClient, StandXWSClient
 from exchanges.hibachi_client import HibachiClient, HibachiWSClient
-from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional, is_opposite_direction_better
+from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional, is_opposite_direction_better, should_exit_spread
 from monitor import MarginLevel, check_margin_level, estimate_sip2_yield
 from telegram_ui import TelegramUI
 
@@ -376,8 +376,8 @@ class DeltaNeutralBot:
                     if p.get("symbol") == Config.PAIR_HIBACHI:
                         hb_now = abs(float(p.get("quantity", p.get("size", 0))))
 
-                sx_closed = sx_total - sx_now < sx_chunk * (chunk_idx + 0.5)
-                hb_closed = hb_total - hb_now < hb_chunk * (chunk_idx + 0.5)
+                sx_closed = sx_total - sx_now >= sx_chunk * (chunk_idx + 0.5)
+                hb_closed = hb_total - hb_now >= hb_chunk * (chunk_idx + 0.5)
 
                 if not sx_closed or not hb_closed:
                     logger.warning("청크 %d 미체결 (시도 %d) sx잔량=%.3f hb잔량=%.6f",
@@ -555,6 +555,11 @@ class DeltaNeutralBot:
                 hb_8h = normalize_funding_to_8h(hb_rate, period_hours=8)
 
                 direction = decide_direction(sx_8h, hb_8h)
+                if direction is None:
+                    logger.info("양쪽 펀딩 모두 음수 → IDLE 유지, 다음 폴링에서 재분석")
+                    self.state.cycle_state = CycleState.IDLE
+                    self._save_state()
+                    return
 
                 sx_bal = await self.standx.get_balance()
                 hb_bal = await self.hibachi.get_balance()
@@ -588,11 +593,20 @@ class DeltaNeutralBot:
                 if success:
                     self._cycle_entered_at = time.time()
                     self._cumulative_funding_cost = 0.0
-                    self._last_hold_log = 0.0  # 새 사이클 즉시 HOLD 로그
+                    self._last_hold_log = 0.0
+                    sx_entry = self._positions["standx"].entry_price
+                    hb_entry = self._positions["hibachi"].entry_price
+                    if "standx_long" in direction:
+                        entry_spread = sx_entry - hb_entry
+                    else:
+                        entry_spread = hb_entry - sx_entry
                     self._current_cycle = Cycle(
                         cycle_id=self.state.current_cycle_id,
                         direction=direction,
                         notional=notional,
+                        entry_sx_price=sx_entry,
+                        entry_hb_price=hb_entry,
+                        entry_spread=entry_spread,
                     )
                     self.state.cycle_state = CycleState.HOLD
                     self.state.weekly_hibachi_volume += notional
@@ -602,7 +616,9 @@ class DeltaNeutralBot:
                         f"✅ 사이클 #{self.state.current_cycle_id} 진입\n"
                         f"방향: {direction}\n"
                         f"노셔널: ${notional:,.0f}\n"
-                        f"StandX: ${sx_available:,.2f} / Hibachi: ${hb_available:,.2f}"
+                        f"진입 스프레드: ${entry_spread:.2f}\n"
+                        f"StandX: ${sx_available:,.2f} @ ${sx_entry:,.2f}\n"
+                        f"Hibachi: ${hb_available:,.2f} @ ${hb_entry:,.2f}"
                     )
                 else:
                     self.state.cycle_state = CycleState.IDLE
@@ -654,7 +670,28 @@ class DeltaNeutralBot:
                     self.standx_price, self.hibachi_price, margin_level.name,
                 )
 
-            if should_exit_cycle(
+            # 기회적 청산: 스프레드 MTM이 threshold 이상이면 즉시 EXIT (MIN_HOLD 무관)
+            sx_pos = self._positions.get("standx")
+            hb_pos = self._positions.get("hibachi")
+            if sx_pos and hb_pos and self.standx_price > 0 and self.hibachi_price > 0:
+                delta_sum = (sx_pos.calc_unrealized_pnl(self.standx_price)
+                             + hb_pos.calc_unrealized_pnl(self.hibachi_price))
+                if should_exit_spread(delta_sum, Config.SPREAD_EXIT_THRESHOLD):
+                    logger.info(
+                        "기회적 청산 EXIT: delta_sum=$%.2f >= $%.0f (보유 %.1fh)",
+                        delta_sum, Config.SPREAD_EXIT_THRESHOLD, hold_hours,
+                    )
+                    if self._current_cycle:
+                        self._current_cycle.exit_reason = "spread_opportunity"
+                    await self.telegram.send_alert(
+                        f"💰 기회적 청산! 스프레드 수익 ${delta_sum:+,.1f}\n"
+                        f"(threshold ${Config.SPREAD_EXIT_THRESHOLD:.0f}, 보유 {hold_hours:.1f}h)"
+                    )
+                    self.state.cycle_state = CycleState.EXIT
+                    self._save_state()
+                    return
+
+            exit_reason = should_exit_cycle(
                 hold_hours=hold_hours,
                 min_hold_hours=Config.MIN_HOLD_HOURS,
                 cumulative_funding_cost=self._cumulative_funding_cost,
@@ -662,11 +699,14 @@ class DeltaNeutralBot:
                 margin_ratio_min=worst_margin,
                 margin_emergency_pct=Config.MARGIN_EMERGENCY_PCT,
                 max_hold_days=Config.MAX_HOLD_DAYS,
-            ):
+            )
+            if exit_reason:
                 logger.info(
-                    "EXIT 트리거: 보유=%.1fh, 펀딩비용=%.6f, 마진=%.1f%%",
-                    hold_hours, self._cumulative_funding_cost, worst_margin,
+                    "EXIT 트리거(%s): 보유=%.1fh, 펀딩비용=%.6f, 마진=%.1f%%",
+                    exit_reason, hold_hours, self._cumulative_funding_cost, worst_margin,
                 )
+                if self._current_cycle:
+                    self._current_cycle.exit_reason = exit_reason
                 self.state.cycle_state = CycleState.EXIT
                 self._save_state()
 
@@ -680,6 +720,19 @@ class DeltaNeutralBot:
 
             if self._current_cycle:
                 self._current_cycle.exited_at = time.time()
+                self._current_cycle.exit_sx_price = self.standx_price
+                self._current_cycle.exit_hb_price = self.hibachi_price
+                if "standx_long" in self._current_cycle.direction:
+                    exit_spread = self.hibachi_price - self.standx_price
+                else:
+                    exit_spread = self.standx_price - self.hibachi_price
+                self._current_cycle.exit_spread = exit_spread
+                avg_price = (self.standx_price + self.hibachi_price) / 2 or 1
+                self._current_cycle.spread_cost = round(
+                    (self._current_cycle.entry_spread + exit_spread)
+                    * (self._current_cycle.notional / avg_price),
+                    2,
+                )
                 sx_bal = await self.standx.get_balance()
                 hb_bal = await self.hibachi.get_balance()
                 self._current_cycle.standx_balance_after = self._parse_sx_balance(sx_bal)
@@ -693,9 +746,19 @@ class DeltaNeutralBot:
                 self._log_cycle(self._current_cycle)
 
                 hold_h = (self._current_cycle.exited_at - self._current_cycle.entered_at) / 3600
+                reason_label = {
+                    "spread_opportunity": "💰 기회적",
+                    "funding_cost": "📉 펀딩비용",
+                    "max_hold": "⏰ 최대보유",
+                    "margin_emergency": "🚨 마진긴급",
+                    "direction_switch": "🔄 방향전환",
+                }.get(self._current_cycle.exit_reason, "🔄")
                 await self.telegram.send_alert(
-                    f"🔄 사이클 #{self._current_cycle.cycle_id} 청산\n"
+                    f"{reason_label} 사이클 #{self._current_cycle.cycle_id} 청산\n"
                     f"보유: {hold_h:.1f}시간\n"
+                    f"진입 스프레드: ${self._current_cycle.entry_spread:.2f}\n"
+                    f"청산 스프레드: ${exit_spread:.2f}\n"
+                    f"스프레드 비용: ${self._current_cycle.spread_cost:.2f}\n"
                     f"StandX: ${self._current_cycle.standx_balance_after:,.2f}\n"
                     f"Hibachi: ${self._current_cycle.hibachi_balance_after:,.2f}"
                 )
@@ -766,13 +829,19 @@ class DeltaNeutralBot:
             else:
                 self._cycle_entered_at = time.time()
 
-            # _current_cycle 재구성 (저장된 정보로)
             direction_recovered = self.state.current_direction or "standx_short_hibachi_long"
+            if "standx_long" in direction_recovered:
+                recovered_spread = sx_entry - hb_entry
+            else:
+                recovered_spread = hb_entry - sx_entry
             self._current_cycle = Cycle(
                 cycle_id=self.state.current_cycle_id or 1,
                 direction=direction_recovered,
                 notional=notional,
                 entered_at=self._cycle_entered_at,
+                entry_sx_price=sx_entry,
+                entry_hb_price=hb_entry,
+                entry_spread=recovered_spread,
             )
 
             await self.telegram.send_alert(
@@ -983,7 +1052,15 @@ class DeltaNeutralBot:
             await self.telegram.send_alert("⏹ 봇 종료 중... 포지션 청산")
             self._running = False  # C7: 먼저 플래그 설정
             if self._positions:
+                if self._current_cycle:
+                    self._current_cycle.exit_reason = "manual_stop"
+                    self._current_cycle.exited_at = time.time()
+                    self._current_cycle.exit_sx_price = self.standx_price
+                    self._current_cycle.exit_hb_price = self.hibachi_price
                 success = await self._execute_exit()
+                if self._current_cycle:
+                    self._log_cycle(self._current_cycle)
+                    self._current_cycle = None
                 if not success:
                     await self.telegram.send_alert("🚨 Stop 청산 부분 실패! 수동 확인 필요!")
             self._save_state()
@@ -1082,7 +1159,13 @@ class DeltaNeutralBot:
                                 f"포지션 감시 불가 — 긴급 청산 실행!"
                             )
                             exit_ok = await self._execute_exit()
-                            # RC-4: 긴급 청산 후 상태 정리
+                            # RC-4: 긴급 청산 후 Cycle 기록 + 상태 정리
+                            if self._current_cycle:
+                                self._current_cycle.exit_reason = "api_emergency"
+                                self._current_cycle.exited_at = time.time()
+                                self._current_cycle.exit_sx_price = self.standx_price
+                                self._current_cycle.exit_hb_price = self.hibachi_price
+                                self._log_cycle(self._current_cycle)
                             self._current_cycle = None
                             self._cycle_entered_at = None
                             self.state.cycle_entered_at = 0.0
@@ -1134,6 +1217,8 @@ class DeltaNeutralBot:
                                 hold_hours = (time.time() - self._cycle_entered_at) / 3600 if self._cycle_entered_at else 0
                                 if hold_hours >= Config.MIN_HOLD_HOURS:
                                     logger.info("S5: 반대 방향 유리 → EXIT 트리거")
+                                    if self._current_cycle:
+                                        self._current_cycle.exit_reason = "direction_switch"
                                     await self.telegram.send_alert("🔄 반대 방향이 유리해짐 → 전환 준비")
                                     self.state.cycle_state = CycleState.EXIT
                                     self._save_state()

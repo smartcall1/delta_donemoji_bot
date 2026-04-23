@@ -58,6 +58,14 @@ class Cycle:
     sip2_yield_estimate: float = 0.0
     standx_balance_after: float = 0.0
     hibachi_balance_after: float = 0.0
+    entry_sx_price: float = 0.0
+    entry_hb_price: float = 0.0
+    exit_sx_price: float = 0.0
+    exit_hb_price: float = 0.0
+    entry_spread: float = 0.0
+    exit_spread: float = 0.0
+    spread_cost: float = 0.0
+    exit_reason: str = ""
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
