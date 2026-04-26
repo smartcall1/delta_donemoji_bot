@@ -66,6 +66,16 @@ class Cycle:
     exit_spread: float = 0.0
     spread_cost: float = 0.0
     exit_reason: str = ""
+    # 4지점 잔고 스냅샷 — 실제 수수료/PnL 측정용
+    # T0=진입 직전 / T1=진입 직후 / T2=청산 직전 / T3=청산 직후
+    balance_t0_total: float = 0.0  # 진입 전 잔고 합 (StandX + Hibachi)
+    balance_t1_total: float = 0.0  # 진입 청크 완료 직후
+    balance_t2_total: float = 0.0  # EXIT 시작 직전
+    balance_t3_total: float = 0.0  # 청산 완료 직후 (= standx_balance_after + hibachi_balance_after)
+    actual_entry_cost: float = 0.0  # T0 - T1 (실제 진입 수수료 + 슬리피지)
+    actual_hold_change: float = 0.0  # T2 - T1 (HOLD 기간 실제 변동 = 펀딩 + 미실현)
+    actual_exit_cost: float = 0.0  # T2 - T3 (실제 청산 수수료 + 슬리피지)
+    actual_total_pnl: float = 0.0  # T3 - T0 (실제 cycle 총 손익)
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -96,6 +106,9 @@ class BotState:
     initial_standx_balance: float = 0.0
     initial_hibachi_balance: float = 0.0
     cumulative_funding_cost: float = 0.0  # RM-6: 펀딩비용 누적 (크래시 복구용)
+    # 4지점 잔고 측정용 (진짜 수수료 추적)
+    balance_after_entry_total: float = 0.0  # T1: 진입 청크 완료 직후 잔고 합
+    balance_before_exit_total: float = 0.0  # T2: 청산 시작 직전 잔고 합
 
     def to_dict(self) -> dict:
         d = asdict(self)

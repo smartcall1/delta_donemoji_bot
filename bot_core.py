@@ -289,10 +289,46 @@ class DeltaNeutralBot:
             f"✅ 분할 진입 완료: ${filled_notional:,.0f}/${notional:,.0f} "
             f"({ENTRY_CHUNKS}청크 중 {int(filled_notional / chunk_notional)}개 체결)"
         )
+
+        # T1 스냅샷: 진입 청크 완료 직후 잔고 — 실제 entry cost 측정용
+        try:
+            sx_bal_t1 = self._parse_sx_balance(await self.standx.get_balance())
+            hb_bal_t1 = self._parse_hb_balance(await self.hibachi.get_balance())
+            self.state.balance_after_entry_total = sx_bal_t1 + hb_bal_t1
+            init_total = self._initial_standx_balance + self._initial_hibachi_balance
+            actual_entry_cost = init_total - self.state.balance_after_entry_total
+            logger.info(
+                "T1 잔고 스냅샷: $%.2f (T0=$%.2f) → 실측 진입 비용 $%.2f",
+                self.state.balance_after_entry_total, init_total, actual_entry_cost,
+            )
+            if self._current_cycle:
+                self._current_cycle.balance_t0_total = init_total
+                self._current_cycle.balance_t1_total = self.state.balance_after_entry_total
+                self._current_cycle.actual_entry_cost = actual_entry_cost
+        except Exception as e:
+            logger.warning("T1 잔고 스냅샷 실패: %s", e)
+
         return True
 
     async def _execute_exit(self) -> bool:
         """양쪽 분할 청산 — RC-5: 실제 포지션 수량 기준, 청크별 양쪽 동시 청산"""
+        # T2 스냅샷: 청산 시작 직전 잔고 — 실제 exit cost + HOLD 변동 측정용
+        try:
+            sx_bal_t2 = self._parse_sx_balance(await self.standx.get_balance())
+            hb_bal_t2 = self._parse_hb_balance(await self.hibachi.get_balance())
+            self.state.balance_before_exit_total = sx_bal_t2 + hb_bal_t2
+            t1_total = self.state.balance_after_entry_total
+            actual_hold_change = self.state.balance_before_exit_total - t1_total if t1_total > 0 else 0
+            logger.info(
+                "T2 잔고 스냅샷: $%.2f (T1=$%.2f) → 실측 HOLD 변동 $%+.2f (펀딩 - 미실현)",
+                self.state.balance_before_exit_total, t1_total, actual_hold_change,
+            )
+            if self._current_cycle:
+                self._current_cycle.balance_t2_total = self.state.balance_before_exit_total
+                self._current_cycle.actual_hold_change = actual_hold_change
+        except Exception as e:
+            logger.warning("T2 잔고 스냅샷 실패: %s", e)
+
         actual_sizes = {}
         try:
             sx_positions = await self.standx.get_positions()
@@ -742,6 +778,28 @@ class DeltaNeutralBot:
                 self.state.weekly_hibachi_volume += self._current_cycle.notional
                 fee = self._current_cycle.notional * 0.0001
                 self.state.cumulative_fees += fee
+
+                # T3 스냅샷 + 실제 cycle PnL 계산 (4지점 분해)
+                t3_total = (
+                    self._current_cycle.standx_balance_after
+                    + self._current_cycle.hibachi_balance_after
+                )
+                self._current_cycle.balance_t3_total = t3_total
+                t0 = self._current_cycle.balance_t0_total
+                t2 = self._current_cycle.balance_t2_total
+                if t0 > 0:
+                    self._current_cycle.actual_total_pnl = t3_total - t0
+                if t2 > 0:
+                    self._current_cycle.actual_exit_cost = t2 - t3_total
+                # 추정치와 비교 알림
+                if t0 > 0:
+                    estimated_pnl = self._current_cycle.net_funding - self._current_cycle.fees_paid
+                    actual_pnl = self._current_cycle.actual_total_pnl
+                    drift = estimated_pnl - actual_pnl
+                    logger.info(
+                        "Cycle PnL 비교: 봇 추정 $%+.2f vs 실제 $%+.2f (차이 $%+.2f)",
+                        estimated_pnl, actual_pnl, drift,
+                    )
 
                 self._log_cycle(self._current_cycle)
 
