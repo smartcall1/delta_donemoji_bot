@@ -1029,18 +1029,37 @@ class DeltaNeutralBot:
                 lines.append(f"{emoji} ${pnl:+,.2f} ({pct:+.2f}%)")
                 lines.append(f"진입 ${init_total:,.2f}")
 
-            # ── 마진 / spread / 펀딩 (HOLD 활성 시) ──
+            # ── 마진 / 펀딩 rate (모니터링) + 사이클 분해 (HOLD 활성 시) ──
             if (sx_pos and hb_pos
                     and self.standx_price > 0 and self.hibachi_price > 0):
                 sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
                 hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
                 sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
                 hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
+                spread_mtm = sx_pnl + hb_pnl
                 lines.append("")
                 lines.append(f"🏦 마진 {sx_margin:.0f}% / {hb_margin:.0f}%")
-                lines.append(f"📈 spread MTM ${sx_pnl + hb_pnl:+,.2f}")
                 lines.append(f"⏳ 펀딩 rate {self._cumulative_funding_cost:+.3f}")
-                lines.append(f"   (임계 ±{Config.FUNDING_COST_THRESHOLD})")
+                lines.append(f"   임계 ±{Config.FUNDING_COST_THRESHOLD}")
+
+                # ── 사이클 분해: 실잔고 변화를 펀딩/수수료/spread로 역산 ──
+                notional = (sx_pos.notional if sx_pos else hb_pos.notional)
+                if init_total > 0 and notional > 0:
+                    realized_cycle = total - init_total
+                    entry_fee = notional * 0.0001  # 진입 시 차감 추정 (1bp)
+                    funding_implied = realized_cycle + entry_fee - spread_mtm
+
+                    def _money(v):
+                        sign = "+" if v >= 0 else "-"
+                        return f"{sign}${abs(v):,.2f}"
+
+                    real_emoji = "🟢" if realized_cycle >= 0 else "🔴"
+                    lines.append("")
+                    lines.append("━ 분해 ━")
+                    lines.append(f"⏳ 펀딩 ≈ {_money(funding_implied)} (역산)")
+                    lines.append(f"💸 진입 수수료 ≈ -${entry_fee:,.2f}")
+                    lines.append(f"📈 spread MTM ≈ {_money(spread_mtm)}")
+                    lines.append(f"{real_emoji} 실잔고 PnL = {_money(realized_cycle)}")
 
             # ── 누적 realized ──
             agg = _aggregate_realized()
