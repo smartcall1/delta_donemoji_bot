@@ -964,16 +964,27 @@ class DeltaNeutralBot:
                 if notional > 0:
                     lines.append("")
                     lines.append("━━ 사이클 수익 ━━")
+                    # 실잔고 기준 사이클 PnL (가장 정확) — initial_*_balance는 ANALYZE 시 저장됨
+                    init_total = self._initial_standx_balance + self._initial_hibachi_balance
+                    cur_total = self.state.standx_balance + self.state.hibachi_balance
+                    if init_total > 0:
+                        cycle_real = cur_total - init_total
+                        cycle_emoji = "🟢" if cycle_real >= 0 else "🔴"
+                        lines.append(
+                            f"{cycle_emoji} 실잔고 PnL: ${cycle_real:+,.2f} "
+                            f"(진입 ${init_total:,.2f} → 현재 ${cur_total:,.2f})"
+                        )
+                    # 봇 내부 추정치 (참고용)
                     funding_dollar = -self._cumulative_funding_cost * notional
                     label = "수익" if funding_dollar >= 0 else "비용"
                     lines.append(
-                        f"펀딩 {label}: ${funding_dollar:+,.4f} "
+                        f"펀딩 {label}(추정): ${funding_dollar:+,.4f} "
                         f"(rate {self._cumulative_funding_cost:+.6f} / "
                         f"청산 임계 {Config.FUNDING_COST_THRESHOLD})"
                     )
                     cycle_fee = notional * 0.0001  # 진입 수수료 (이미 누적에 반영)
                     lines.append(
-                        f"진입 수수료(누적반영분): -${cycle_fee:,.4f} "
+                        f"진입 수수료(추정): -${cycle_fee:,.4f} "
                         f"(청산 시 동일분 추가)"
                     )
             else:
@@ -990,13 +1001,23 @@ class DeltaNeutralBot:
                 total = self.state.standx_balance + self.state.hibachi_balance
                 lines.append(f"💼 총 포트폴리오: ${total:,.2f}")
 
+                # 실잔고 기준 진짜 PnL — 추정치 누적 펀딩보다 정확
+                init_total = self._initial_standx_balance + self._initial_hibachi_balance
+                if init_total > 0:
+                    real_pnl = total - init_total
+                    real_emoji = "🟢" if real_pnl >= 0 else "🔴"
+                    lines.append(
+                        f"  {real_emoji} 실잔고 PnL: ${real_pnl:+,.2f} (진입 ${init_total:,.2f} 대비)"
+                    )
+
             # 누적 지표 (전 사이클 통합)
             lines.append("")
-            lines.append("━━ 누적 ━━")
+            lines.append("━━ 누적 (추정치, 봇 내부 추적) ━━")
             net = self.state.cumulative_funding - self.state.cumulative_fees
-            lines.append(f"누적 펀딩 수익: ${self.state.cumulative_funding:+,.2f}")
-            lines.append(f"누적 수수료: -${self.state.cumulative_fees:,.2f}")
-            lines.append(f"순 손익(펀딩-수수료): ${net:+,.2f}")
+            lines.append(f"누적 펀딩 수익(추정): ${self.state.cumulative_funding:+,.2f}")
+            lines.append(f"누적 수수료(추정): -${self.state.cumulative_fees:,.2f}")
+            lines.append(f"순 손익(추정 합산): ${net:+,.2f}")
+            lines.append("<i>※ 누적은 rate × time 추정치. 실제 정산값과 다를 수 있음</i>")
             pct = self.state.weekly_hibachi_volume / 1000.0  # of $100K
             lines.append(
                 f"주간 거래량: ${self.state.weekly_hibachi_volume:,.0f} "
