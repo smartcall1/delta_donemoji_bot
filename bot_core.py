@@ -677,6 +677,29 @@ class DeltaNeutralBot:
                 await self.telegram.send_alert("🚨 마진율 위험! 양쪽 긴급 청산 실행!")
                 success = await self._execute_exit()
                 if success:
+                    if self._current_cycle:
+                        self._current_cycle.exit_reason = "margin_emergency"
+                        self._current_cycle.exited_at = time.time()
+                        self._current_cycle.exit_sx_price = self.standx_price
+                        self._current_cycle.exit_hb_price = self.hibachi_price
+                        try:
+                            sx_bal = await self.standx.get_balance()
+                            hb_bal = await self.hibachi.get_balance()
+                            self._current_cycle.standx_balance_after = self._parse_sx_balance(sx_bal)
+                            self._current_cycle.hibachi_balance_after = self._parse_hb_balance(hb_bal)
+                            self._current_cycle.balance_t3_total = (
+                                self._current_cycle.standx_balance_after
+                                + self._current_cycle.hibachi_balance_after
+                            )
+                            self.state.standx_balance = self._current_cycle.standx_balance_after
+                            self.state.hibachi_balance = self._current_cycle.hibachi_balance_after
+                        except Exception as e:
+                            logger.warning("긴급 청산 후 잔고 조회 실패: %s", e)
+                        self._log_cycle(self._current_cycle)
+                        self._current_cycle = None
+                    self._cycle_entered_at = None
+                    self.state.cycle_entered_at = 0.0
+                    self.state.current_direction = ""
                     self.state.cycle_state = CycleState.COOLDOWN
                     self._cooldown_until = time.time() + Config.COOLDOWN_HOURS * 3600
                 else:
@@ -753,6 +776,19 @@ class DeltaNeutralBot:
                 # C2: 부분 실패 시 EXIT 유지, 다음 틱에 재시도
                 self._save_state()
                 return
+
+            if not self._current_cycle:
+                logger.warning(
+                    "EXIT: _current_cycle이 None — state로부터 fallback 재구성 (cycle_id=%d)",
+                    self.state.current_cycle_id,
+                )
+                self._current_cycle = Cycle(
+                    cycle_id=self.state.current_cycle_id,
+                    direction=self.state.current_direction or "unknown",
+                    notional=0.0,
+                    entered_at=self._cycle_entered_at or time.time(),
+                    exit_reason="recovered_no_context",
+                )
 
             if self._current_cycle:
                 self._current_cycle.exited_at = time.time()
