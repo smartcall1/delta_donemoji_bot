@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 # 전역 하단 고정 버튼 텍스트
 BTN_STATUS = "📊 Status"
+BTN_DETAIL = "🔍 Detail"
 BTN_HISTORY = "📋 History"
 BTN_FUNDING = "💰 Funding"
 BTN_REBALANCE = "🔄 Rebalance"
@@ -19,8 +20,8 @@ BTN_STOP = "⏹ Stop"
 
 KEYBOARD = {
     "keyboard": [
-        [BTN_STATUS, BTN_HISTORY, BTN_FUNDING],
-        [BTN_REBALANCE, BTN_STOP],
+        [BTN_STATUS, BTN_DETAIL, BTN_HISTORY],
+        [BTN_FUNDING, BTN_REBALANCE, BTN_STOP],
     ],
     "resize_keyboard": True,
     "is_persistent": True,

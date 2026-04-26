@@ -960,165 +960,197 @@ class DeltaNeutralBot:
         self._save_state()
 
     def _register_telegram_callbacks(self):
-        async def on_status(cb):
-            state = self.state.cycle_state
-            lines = ["📊 <b>Status</b>", "━━━━━━━━━━━━━━━"]
+        def _aggregate_realized():
+            """cycles.jsonl에서 realized 사이클만 합산 — Status/Detail 공통 헬퍼"""
+            agg = {"count": 0, "pnl": 0.0, "funding": 0.0, "fees": 0.0}
+            cycles_path = os.path.join(Config.LOG_DIR, "cycles.jsonl")
+            if not os.path.exists(cycles_path):
+                return agg
+            try:
+                with open(cycles_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        c = json.loads(line)
+                        # actual_total_pnl 필드 있는 사이클만 (cycle 8+)
+                        if "actual_total_pnl" in c and c.get("balance_t0_total", 0) > 0:
+                            agg["pnl"] += c.get("actual_total_pnl", 0.0)
+                            agg["funding"] += c.get("net_funding", 0.0)
+                            agg["fees"] += c.get("fees_paid", 0.0)
+                            agg["count"] += 1
+            except Exception as e:
+                logger.warning("cycles.jsonl 누적 합산 실패: %s", e)
+            return agg
 
-            # 헤더: 상태 + 경과/남은 시간
+        async def on_status(cb):
+            """🅰️ Glanceable Status — 모바일 한 화면, 한 줄 22자 이내"""
+            state = self.state.cycle_state
+            lines = []
+
+            # ── 헤더: 상태 + 경과시간 + MIN_HOLD 통과 표시 ──
             if state == CycleState.HOLD and self._cycle_entered_at:
                 hold_h = (time.time() - self._cycle_entered_at) / 3600
+                if hold_h >= Config.MIN_HOLD_HOURS:
+                    badge = "✅"
+                else:
+                    remain = Config.MIN_HOLD_HOURS - hold_h
+                    badge = f"⏰{remain:.1f}h남음"
                 lines.append(
-                    f"상태: HOLD #{self.state.current_cycle_id} "
-                    f"({hold_h:.1f}h / 최소 {Config.MIN_HOLD_HOURS}h)"
+                    f"📊 #{self.state.current_cycle_id} HOLD {hold_h:.1f}h {badge}"
                 )
             elif state == CycleState.COOLDOWN and self._cooldown_until:
                 remaining = max(0.0, (self._cooldown_until - time.time()) / 3600)
-                lines.append(f"상태: COOLDOWN (남은 {remaining:.1f}h)")
+                lines.append(f"📊 COOLDOWN {remaining:.1f}h 남음")
             else:
-                lines.append(f"상태: {state.value}")
+                lines.append(f"📊 {state.value}")
 
-            # 활성 포지션: 방향·포지션·사이클 손익
-            if self._positions:
-                sx_pos = self._positions.get("standx")
-                hb_pos = self._positions.get("hibachi")
+            # ── 방향 표시 (포지션 있을 때만) ──
+            sx_pos = self._positions.get("standx") if self._positions else None
+            hb_pos = self._positions.get("hibachi") if self._positions else None
+            if sx_pos:
+                color = "🟢" if sx_pos.side == "LONG" else "🔴"
+                lines.append(f"{color} StandX {sx_pos.side}")
+            if hb_pos:
+                color = "🟢" if hb_pos.side == "LONG" else "🔴"
+                lines.append(f"{color} Hibachi {hb_pos.side}")
+            if (sx_pos and not hb_pos) or (hb_pos and not sx_pos):
+                lines.append("⚠️ 편측 포지션!")
 
-                # 방향 — state.current_direction 우선, 빈 값이면 Position.side로 폴백
-                direction = self.state.current_direction or ""
-                if not direction and sx_pos and hb_pos:
-                    direction = (
-                        "standx_long_hibachi_short"
-                        if sx_pos.side == "LONG" else "standx_short_hibachi_long"
-                    )
-                if "standx_long" in direction:
-                    lines.append("방향: StandX 🟢LONG | Hibachi 🔴SHORT")
-                elif "standx_short" in direction:
-                    lines.append("방향: StandX 🔴SHORT | Hibachi 🟢LONG")
-
-                # 편측 포지션 감지 — 양쪽 모두 있어야 정상
-                if (sx_pos and not hb_pos) or (hb_pos and not sx_pos):
-                    lines.append("⚠️ 편측 포지션 감지! 수동 확인 필요")
-
-                lines.append("")
-                lines.append("━━ 포지션 ━━")
-
-                sx_pnl = hb_pnl = 0.0
-                sx_price_ok = hb_price_ok = False
-
-                if sx_pos:
-                    sx_price_ok = self.standx_price > 0
-                    lines.append(
-                        f"StandX ({sx_pos.side}): ${sx_pos.notional:,.0f} "
-                        f"@ ${sx_pos.entry_price:,.2f}"
-                    )
-                    if sx_price_ok:
-                        sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
-                        sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
-                        lines.append(
-                            f"  잔액 ${self.state.standx_balance:,.2f} | "
-                            f"현재 ${self.standx_price:,.2f}"
-                        )
-                        lines.append(
-                            f"  미실현 PnL: ${sx_pnl:+,.2f} | 마진: {sx_margin:.1f}%"
-                        )
-                    else:
-                        lines.append(
-                            f"  잔액 ${self.state.standx_balance:,.2f} | 가격 로딩중…"
-                        )
-
-                if hb_pos:
-                    hb_price_ok = self.hibachi_price > 0
-                    lines.append(
-                        f"Hibachi ({hb_pos.side}): ${hb_pos.notional:,.0f} "
-                        f"@ ${hb_pos.entry_price:,.2f}"
-                    )
-                    if hb_price_ok:
-                        hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
-                        hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
-                        lines.append(
-                            f"  잔액 ${self.state.hibachi_balance:,.2f} | "
-                            f"현재 ${self.hibachi_price:,.2f}"
-                        )
-                        lines.append(
-                            f"  미실현 PnL: ${hb_pnl:+,.2f} | 마진: {hb_margin:.1f}%"
-                        )
-                    else:
-                        lines.append(
-                            f"  잔액 ${self.state.hibachi_balance:,.2f} | 가격 로딩중…"
-                        )
-
-                # 델타 뉴트럴 유지도 + 총 포트폴리오
-                if sx_pos and hb_pos and sx_price_ok and hb_price_ok:
-                    lines.append(f"  델타 순합: ${sx_pnl + hb_pnl:+,.2f} (목표 ≈0)")
-                total = self.state.standx_balance + self.state.hibachi_balance
-                lines.append(f"  💼 총 포트폴리오: ${total:,.2f}")
-
-                # 사이클 손익 (현재 사이클 한정)
-                notional = (sx_pos.notional if sx_pos else
-                            hb_pos.notional if hb_pos else 0.0)
-                if notional > 0:
-                    lines.append("")
-                    lines.append("━━ 사이클 수익 ━━")
-                    # 실잔고 기준 사이클 PnL (가장 정확) — initial_*_balance는 ANALYZE 시 저장됨
-                    init_total = self._initial_standx_balance + self._initial_hibachi_balance
-                    cur_total = self.state.standx_balance + self.state.hibachi_balance
-                    if init_total > 0:
-                        cycle_real = cur_total - init_total
-                        cycle_emoji = "🟢" if cycle_real >= 0 else "🔴"
-                        lines.append(
-                            f"{cycle_emoji} 실잔고 PnL: ${cycle_real:+,.2f} "
-                            f"(진입 ${init_total:,.2f} → 현재 ${cur_total:,.2f})"
-                        )
-                    # 봇 내부 추정치 (참고용)
-                    funding_dollar = -self._cumulative_funding_cost * notional
-                    label = "수익" if funding_dollar >= 0 else "비용"
-                    lines.append(
-                        f"펀딩 {label}(추정): ${funding_dollar:+,.4f} "
-                        f"(rate {self._cumulative_funding_cost:+.6f} / "
-                        f"청산 임계 {Config.FUNDING_COST_THRESHOLD})"
-                    )
-                    cycle_fee = notional * 0.0001  # 진입 수수료 (이미 누적에 반영)
-                    lines.append(
-                        f"진입 수수료(추정): -${cycle_fee:,.4f} "
-                        f"(청산 시 동일분 추가)"
-                    )
-            else:
-                # IDLE / COOLDOWN / ANALYZE — 포지션 없음
-                lines.append("")
-                lines.append(
-                    f"StandX:  ${self.state.standx_balance:,.2f} "
-                    f"(ETH ${self.standx_price:,.2f})"
-                )
-                lines.append(
-                    f"Hibachi: ${self.state.hibachi_balance:,.2f} "
-                    f"(ETH ${self.hibachi_price:,.2f})"
-                )
-                total = self.state.standx_balance + self.state.hibachi_balance
-                lines.append(f"💼 총 포트폴리오: ${total:,.2f}")
-
-                # 실잔고 기준 진짜 PnL — 추정치 누적 펀딩보다 정확
-                init_total = self._initial_standx_balance + self._initial_hibachi_balance
-                if init_total > 0:
-                    real_pnl = total - init_total
-                    real_emoji = "🟢" if real_pnl >= 0 else "🔴"
-                    lines.append(
-                        f"  {real_emoji} 실잔고 PnL: ${real_pnl:+,.2f} (진입 ${init_total:,.2f} 대비)"
-                    )
-
-            # 누적 지표 (전 사이클 통합)
+            # ── 손익 ──
+            total = self.state.standx_balance + self.state.hibachi_balance
+            init_total = self._initial_standx_balance + self._initial_hibachi_balance
             lines.append("")
-            lines.append("━━ 누적 (추정치, 봇 내부 추적) ━━")
-            net = self.state.cumulative_funding - self.state.cumulative_fees
-            lines.append(f"누적 펀딩 수익(추정): ${self.state.cumulative_funding:+,.2f}")
-            lines.append(f"누적 수수료(추정): -${self.state.cumulative_fees:,.2f}")
-            lines.append(f"순 손익(추정 합산): ${net:+,.2f}")
-            lines.append("<i>※ 누적은 rate × time 추정치. 실제 정산값과 다를 수 있음</i>")
-            pct = self.state.weekly_hibachi_volume / 1000.0  # of $100K
-            lines.append(
-                f"주간 거래량: ${self.state.weekly_hibachi_volume:,.0f} "
-                f"/ $100K ({pct:.1f}%)"
-            )
+            lines.append(f"💰 ${total:,.2f}")
+            if init_total > 0:
+                pnl = total - init_total
+                pct = pnl / init_total * 100
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                lines.append(f"{emoji} ${pnl:+,.2f} ({pct:+.2f}%)")
+                lines.append(f"진입 ${init_total:,.2f}")
+
+            # ── 마진 / spread / 펀딩 (HOLD 활성 시) ──
+            if (sx_pos and hb_pos
+                    and self.standx_price > 0 and self.hibachi_price > 0):
+                sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
+                hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
+                sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
+                hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
+                lines.append("")
+                lines.append(f"🏦 마진 {sx_margin:.0f}% / {hb_margin:.0f}%")
+                lines.append(f"📈 spread MTM ${sx_pnl + hb_pnl:+,.2f}")
+                lines.append(f"⏳ 펀딩 rate {self._cumulative_funding_cost:+.3f}")
+                lines.append(f"   (임계 ±{Config.FUNDING_COST_THRESHOLD})")
+
+            # ── 누적 realized ──
+            agg = _aggregate_realized()
+            lines.append("")
+            lines.append("━ 누적 (realized) ━")
+            if agg["count"] > 0:
+                emoji = "🟢" if agg["pnl"] >= 0 else "🔴"
+                lines.append(
+                    f"{emoji} {agg['count']}건 누적 ${agg['pnl']:+,.2f}"
+                )
+            else:
+                lines.append("🌱 cycle 8부터 누적 시작")
+            pct_v = self.state.weekly_hibachi_volume / 1000.0
+            lines.append(f"📦 거래량 {pct_v:.0f}% / $100K")
+
+            lines.append("")
+            lines.append("<i>🔍 자세히 → Detail 버튼</i>")
 
             await self.telegram.send_main_menu("\n".join(lines))
+
+        async def on_detail(cb):
+            """🔍 Detail — 디버그/검증용 풀 정보. 한 줄 22자 이내 유지"""
+            lines = ["🔍 <b>Detail</b>"]
+
+            sx_pos = self._positions.get("standx") if self._positions else None
+            hb_pos = self._positions.get("hibachi") if self._positions else None
+
+            if sx_pos:
+                lines.append("")
+                color = "🟢" if sx_pos.side == "LONG" else "🔴"
+                lines.append(f"━ {color} StandX {sx_pos.side} ━")
+                lines.append(f"notional ${sx_pos.notional:,.0f}")
+                lines.append(f"진입 ${sx_pos.entry_price:,.2f}")
+                lines.append(f"잔액 ${self.state.standx_balance:,.2f} (MTM)")
+                if self.standx_price > 0:
+                    sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
+                    sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
+                    lines.append(f"미실현 ${sx_pnl:+,.2f}")
+                    lines.append("<i>※ 잔액에 이미 반영됨</i>")
+                    lines.append(f"현재가 ${self.standx_price:,.2f}")
+                    lines.append(f"마진율 {sx_margin:.1f}%")
+                else:
+                    lines.append("가격 로딩중…")
+
+            if hb_pos:
+                lines.append("")
+                color = "🟢" if hb_pos.side == "LONG" else "🔴"
+                lines.append(f"━ {color} Hibachi {hb_pos.side} ━")
+                lines.append(f"notional ${hb_pos.notional:,.0f}")
+                lines.append(f"진입 ${hb_pos.entry_price:,.2f}")
+                lines.append(f"잔액 ${self.state.hibachi_balance:,.2f} (MTM)")
+                if self.hibachi_price > 0:
+                    hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
+                    hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
+                    lines.append(f"미실현 ${hb_pnl:+,.2f}")
+                    lines.append("<i>※ 잔액에 이미 반영됨</i>")
+                    lines.append(f"현재가 ${self.hibachi_price:,.2f}")
+                    lines.append(f"마진율 {hb_margin:.1f}%")
+                else:
+                    lines.append("가격 로딩중…")
+
+            if (sx_pos and hb_pos
+                    and self.standx_price > 0 and self.hibachi_price > 0):
+                sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
+                hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
+                lines.append("")
+                lines.append("━ spread / 펀딩 ━")
+                lines.append(f"spread MTM ${sx_pnl + hb_pnl:+,.2f}")
+                lines.append("<i>※ 거래소간 가격 격차 MTM,</i>")
+                lines.append("<i>  ETH 델타 아님</i>")
+                lines.append(
+                    f"펀딩 rate {self._cumulative_funding_cost:+.6f}"
+                )
+                lines.append(f"청산 임계 ±{Config.FUNDING_COST_THRESHOLD}")
+
+            if not self._positions:
+                lines.append("")
+                lines.append("━ 잔고 ━")
+                lines.append(f"StandX  ${self.state.standx_balance:,.2f}")
+                lines.append(f"Hibachi ${self.state.hibachi_balance:,.2f}")
+                total = self.state.standx_balance + self.state.hibachi_balance
+                lines.append(f"💼 합계 ${total:,.2f}")
+                init_total = (self._initial_standx_balance
+                              + self._initial_hibachi_balance)
+                if init_total > 0:
+                    pnl = total - init_total
+                    emoji = "🟢" if pnl >= 0 else "🔴"
+                    lines.append(f"{emoji} ${pnl:+,.2f} (진입 대비)")
+
+            # 누적 realized
+            agg = _aggregate_realized()
+            lines.append("")
+            lines.append("━ 누적 (realized) ━")
+            if agg["count"] > 0:
+                emoji = "🟢" if agg["pnl"] >= 0 else "🔴"
+                lines.append(f"완료 사이클 {agg['count']}건")
+                lines.append(f"{emoji} 누적 ${agg['pnl']:+,.2f}")
+                lines.append(f"  └ 펀딩 ${agg['funding']:+,.2f}")
+                lines.append(f"  └ 수수료 -${agg['fees']:,.2f}")
+            else:
+                lines.append("🌱 cycle 8부터 누적 시작")
+
+            pct_v = self.state.weekly_hibachi_volume / 1000.0
+            lines.append("")
+            lines.append("📦 주간 거래량")
+            lines.append(
+                f"${self.state.weekly_hibachi_volume:,.0f} / $100K ({pct_v:.1f}%)"
+            )
+
+            await self.telegram.send_alert("\n".join(lines))
 
         async def on_history(cb):
             path = os.path.join(Config.LOG_DIR, "cycles.jsonl")
@@ -1184,8 +1216,12 @@ class DeltaNeutralBot:
             with open(stop_file, "w") as f:
                 f.write(str(time.time()))
 
-        from telegram_ui import BTN_STATUS, BTN_HISTORY, BTN_FUNDING, BTN_REBALANCE, BTN_STOP
+        from telegram_ui import (
+            BTN_STATUS, BTN_DETAIL, BTN_HISTORY,
+            BTN_FUNDING, BTN_REBALANCE, BTN_STOP,
+        )
         self.telegram.register_callback(BTN_STATUS, on_status)
+        self.telegram.register_callback(BTN_DETAIL, on_detail)
         self.telegram.register_callback(BTN_HISTORY, on_history)
         self.telegram.register_callback(BTN_FUNDING, on_funding)
         self.telegram.register_callback(BTN_REBALANCE, on_rebalance)
