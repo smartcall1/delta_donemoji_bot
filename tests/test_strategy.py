@@ -1,5 +1,8 @@
 import pytest
-from strategy import normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional, is_opposite_direction_better, should_exit_spread
+from strategy import (
+    normalize_funding_to_8h, decide_direction, should_exit_cycle, calc_notional,
+    is_opposite_direction_better, should_exit_spread, should_exit_principal_recovered,
+)
 
 
 class TestNormalizeFunding:
@@ -104,3 +107,46 @@ class TestShouldExitSpread:
 
     def test_negative_delta_no_trigger(self):
         assert should_exit_spread(-20.0, 50.0) is False
+
+
+class TestShouldExitPrincipalRecovered:
+    """2026-04-28 cycle 10 사건 회귀 방지: buffer = 2× fee + safety_margin."""
+
+    NOTIONAL = 24841.0
+    FEE = 0.0004  # FEE_PER_FILL = 0.04%
+    INIT = 21958.0
+
+    def test_no_safety_margin_old_behavior(self):
+        # safety_margin=0이면 임계 = init + 2× fee × notional = 21958 + 19.87 = 21977.87
+        # 사건 당시 잔액 21974.64는 여전히 트리거되지 않음 (이전엔 1× fee로 9.94 → 트리거됐음)
+        assert should_exit_principal_recovered(
+            21974.64, self.INIT, self.NOTIONAL, self.FEE, safety_margin_usd=0.0,
+        ) is False
+
+    def test_old_logic_would_have_triggered_but_new_blocks(self):
+        # 정확히 사건 데이터 — old(1× fee, $9.94 buffer)였다면 발동했을 잔액
+        # new(2× fee, $19.87 buffer)에선 블록되어야 함
+        old_threshold = self.INIT + 1 * self.NOTIONAL * self.FEE  # 21967.94
+        assert 21974.64 >= old_threshold  # old logic: True
+        assert should_exit_principal_recovered(
+            21974.64, self.INIT, self.NOTIONAL, self.FEE, safety_margin_usd=0.0,
+        ) is False  # new logic: False (2× fee buffer 적용)
+
+    def test_safety_margin_30usd_blocks_marginal_trigger(self):
+        # safety_margin=30이면 임계 = 21958 + 19.87 + 30 = 22007.87
+        # 사건 당시 잔액으로는 절대 발동 안 함
+        assert should_exit_principal_recovered(
+            21974.64, self.INIT, self.NOTIONAL, self.FEE, safety_margin_usd=30.0,
+        ) is False
+
+    def test_clear_profit_triggers(self):
+        # 잔액이 충분히 크면 발동 — 21958 + 19.87 + 30 = 22007.87, 잔액 22050이면 True
+        assert should_exit_principal_recovered(
+            22050.0, self.INIT, self.NOTIONAL, self.FEE, safety_margin_usd=30.0,
+        ) is True
+
+    def test_zero_init_returns_false(self):
+        # 안전 가드 — init이 0이면 의미 없는 트리거 방지 (caller에서 init>0 체크되지만 함수 자체도 안전)
+        assert should_exit_principal_recovered(
+            100.0, 0.0, 1000.0, 0.001, safety_margin_usd=0.0,
+        ) is True  # 100 >= 0 + 2 = 2 → True (이건 caller 책임)

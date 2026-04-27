@@ -672,7 +672,8 @@ class DeltaNeutralBot:
                 continue
 
             sx_done = False
-            for sx_attempt in range(Config.MAKER_RETRY_LIMIT * 2):
+            sx_max_attempts = Config.MAKER_RETRY_LIMIT * 2
+            for sx_attempt in range(sx_max_attempts):
                 cur_sx = await self._get_standx_position_size()
                 sx_already_closed = sx_at_start - cur_sx
                 sx_to_close = round(sx_target_close - sx_already_closed, 3)
@@ -680,9 +681,15 @@ class DeltaNeutralBot:
                     sx_done = True
                     break
 
+                # Slippage escalation — 시도마다 0.5% × (시도+1)로 증가, EMERGENCY_CLOSE_SLIPPAGE_PCT 상한.
+                # 동일 가격대 무한 retry → bid-ask spread 1% 이상 시 영구 미체결 방지.
+                sx_slippage = min(
+                    0.005 * (sx_attempt + 1),
+                    Config.EMERGENCY_CLOSE_SLIPPAGE_PCT,
+                )
                 try:
                     await self.standx.close_position(
-                        Config.PAIR_STANDX, sx_open_side, sx_to_close, slippage_pct=0.005,
+                        Config.PAIR_STANDX, sx_open_side, sx_to_close, slippage_pct=sx_slippage,
                     )
                 except Exception as e:
                     logger.error("StandX taker 발주 실패 (시도 %d): %s", sx_attempt + 1, e)
@@ -693,8 +700,8 @@ class DeltaNeutralBot:
                 cur_sx2 = await self._get_standx_position_size()
                 if sx_at_start - cur_sx2 >= sx_target_close * 0.98:
                     logger.info(
-                        "StandX taker 청산 청크 %d 매칭 완료: %.3f → %.3f (-%.3f)",
-                        chunk_idx + 1, sx_at_start, cur_sx2, sx_target_close,
+                        "StandX taker 청산 청크 %d 매칭 완료: %.3f → %.3f (-%.3f, slippage %.2f%%)",
+                        chunk_idx + 1, sx_at_start, cur_sx2, sx_target_close, sx_slippage * 100,
                     )
                     sx_done = True
                     break
@@ -704,18 +711,53 @@ class DeltaNeutralBot:
                 except Exception:
                     pass
                 logger.warning(
-                    "StandX taker 부족분 남음, 재시도 (청산 청크 %d 시도 %d, 잔량 %.3f)",
+                    "StandX taker 부족분 남음, 재시도 (청산 청크 %d 시도 %d, 잔량 %.3f, "
+                    "다음 slippage %.2f%%)",
                     chunk_idx + 1, sx_attempt + 1, sx_to_close,
+                    min(0.005 * (sx_attempt + 2), Config.EMERGENCY_CLOSE_SLIPPAGE_PCT) * 100,
                 )
 
             if not sx_done:
+                # P1 응급 청산 — 일반 retry escalation도 실패한 시점.
+                # 편측 노출은 1초마다 가격 리스크가 누적되므로, 최후 수단으로 EMERGENCY_CLOSE_SLIPPAGE_PCT
+                # 전체를 한 번에 태워서 cross-spread를 강제로 통과시킨다.
                 logger.error(
-                    "🚨 청산 청크 %d: hb %.6f 청산했는데 StandX 미체결! 편측 노출!",
+                    "청산 청크 %d: SX taker escalation %d회 실패 → 응급 시장가 시도 "
+                    "(slippage %.2f%%)",
+                    chunk_idx + 1, sx_max_attempts, Config.EMERGENCY_CLOSE_SLIPPAGE_PCT * 100,
+                )
+                await self.telegram.send_alert(
+                    f"🚨 청크 {chunk_idx + 1} SX 응급 시장가 시도 "
+                    f"(slippage {Config.EMERGENCY_CLOSE_SLIPPAGE_PCT * 100:.1f}%)"
+                )
+                try:
+                    cur_sx_emerg = await self._get_standx_position_size()
+                    sx_remaining = round(sx_target_close - (sx_at_start - cur_sx_emerg), 3)
+                    if sx_remaining > 0.001:
+                        await self.standx.close_position(
+                            Config.PAIR_STANDX, sx_open_side, sx_remaining,
+                            slippage_pct=Config.EMERGENCY_CLOSE_SLIPPAGE_PCT,
+                        )
+                        await asyncio.sleep(20)
+                        cur_sx_after = await self._get_standx_position_size()
+                        if sx_at_start - cur_sx_after >= sx_target_close * 0.98:
+                            logger.info(
+                                "응급 시장가 성공: 청크 %d SX %.3f → %.3f",
+                                chunk_idx + 1, sx_at_start, cur_sx_after,
+                            )
+                            sx_done = True
+                except Exception as e:
+                    logger.error("응급 시장가 실패: %s", e)
+
+            if not sx_done:
+                logger.error(
+                    "🚨 청산 청크 %d: hb %.6f 청산했는데 StandX 응급 시장가까지 실패! 편측 노출!",
                     chunk_idx + 1, hb_actual_closed,
                 )
                 await self.telegram.send_alert(
-                    f"🚨🚨 응급: 청산 청크 {chunk_idx + 1} hb {hb_actual_closed:.4f} 청산 → "
-                    f"StandX 매칭 실패! 편측 노출. 수동 개입 필요. 봇은 진행 중단."
+                    f"🚨🚨 청산 청크 {chunk_idx + 1} hb {hb_actual_closed:.4f} 청산 → "
+                    f"StandX 응급 시장가({Config.EMERGENCY_CLOSE_SLIPPAGE_PCT * 100:.1f}%)도 실패! "
+                    f"편측 노출. 수동 개입 필요."
                 )
                 break
 
@@ -864,6 +906,8 @@ class DeltaNeutralBot:
                 return
             self._cooldown_until = None
             self.state.cooldown_until = 0.0
+            # 새 사이클 시작 — 직전 사이클의 failure 카운터 잔재 정리.
+            self.state.exit_failure_count = 0
             self.state.cycle_state = CycleState.ANALYZE
             self._save_state()
 
@@ -1045,19 +1089,25 @@ class DeltaNeutralBot:
                     self._save_state()
                     return
 
-            # 원금 회수 청산 (MIN_HOLD 무관) — 펀딩 누적 ≥ 진입수수료+spread+청산수수료 시 발동
+            # 원금 회수 청산 (MIN_HOLD 무관) — 펀딩 누적 ≥ 진입수수료+spread+청산수수료 시 발동.
+            # 2026-04-28 cycle 10 사건 이후: buffer = 2× fee + spread MTM 회귀 마진(safety_margin_usd)
+            # 으로 확대. MTM 일시 스파이크에 트리거되어 청산 5~14분 동안 spread 회귀로 손실 발생 방지.
             current_total = self.state.standx_balance + self.state.hibachi_balance
             init_total = self._initial_standx_balance + self._initial_hibachi_balance
             cycle_notional = self._current_cycle.notional if self._current_cycle else 0.0
             if init_total > 0 and cycle_notional > 0 and should_exit_principal_recovered(
                 current_total, init_total, cycle_notional, Config.FEE_PER_FILL,
+                safety_margin_usd=Config.PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD,
             ):
                 if self._current_cycle:
                     self._current_cycle.exit_reason = "principal_recovered"
-                buffer = cycle_notional * Config.FEE_PER_FILL
+                fee_buffer = 2 * cycle_notional * Config.FEE_PER_FILL
+                safety_margin = Config.PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD
+                threshold = init_total + fee_buffer + safety_margin
                 await self.telegram.send_alert(
-                    f"💰 원금 회수 청산! 잔액 ${current_total:,.2f} ≥ 진입+수수료 ${init_total + buffer:,.2f}\n"
-                    f"(보유 {hold_hours:.1f}h, 청산 buffer ${buffer:.2f})"
+                    f"💰 원금 회수 청산! 잔액 ${current_total:,.2f} ≥ 임계 ${threshold:,.2f}\n"
+                    f"(진입 ${init_total:,.2f} + 청산 fee ${fee_buffer:.2f} + spread 마진 ${safety_margin:.2f})\n"
+                    f"보유 {hold_hours:.1f}h"
                 )
                 self.state.cycle_state = CycleState.EXIT
                 self._save_state()
@@ -1087,8 +1137,30 @@ class DeltaNeutralBot:
 
             if not success:
                 # C2: 부분 실패 시 EXIT 유지, 다음 틱에 재시도
+                # 단, 연속 N회 실패 시 MANUAL_INTERVENTION으로 전환 — 무한 재호출 방지
+                # (2026-04-28 cycle 10 사건: HB 0 / SX 잔여 상태에서 _execute_exit 15회 무의미 재호출).
+                self.state.exit_failure_count += 1
+                if self.state.exit_failure_count >= Config.MAX_EXIT_FAILURES:
+                    logger.error(
+                        "EXIT %d회 연속 실패 → MANUAL_INTERVENTION 전환",
+                        self.state.exit_failure_count,
+                    )
+                    self.state.cycle_state = CycleState.MANUAL_INTERVENTION
+                    await self.telegram.send_alert(
+                        f"⛔ EXIT {self.state.exit_failure_count}회 연속 실패 → 봇 자동 청산 중단.\n"
+                        f"수동으로 양쪽 거래소 포지션 정리 후 봇 재시작 필요.\n"
+                        f"(재시작 시 _recovery_check가 새 상태 결정)"
+                    )
+                else:
+                    logger.warning(
+                        "EXIT 실패 %d/%d, 다음 틱 재시도",
+                        self.state.exit_failure_count, Config.MAX_EXIT_FAILURES,
+                    )
                 self._save_state()
                 return
+
+            # 성공했으면 카운터 리셋
+            self.state.exit_failure_count = 0
 
             if not self._current_cycle:
                 logger.warning(
@@ -1185,6 +1257,46 @@ class DeltaNeutralBot:
                 self.state.cycle_state = CycleState.IDLE
                 self._save_state()
                 logger.info("쿨다운 종료, IDLE 복귀")
+
+        elif state == CycleState.MANUAL_INTERVENTION:
+            # 봇은 자동 청산을 시도하지 않고 사용자 개입을 기다린다.
+            # 30분마다 한 번 알림을 보내 사용자에게 잊지 않도록 reminder.
+            # 사용자가 양쪽 거래소 포지션을 수동 청산하면 자동으로 IDLE 복귀 (포지션 0 감지).
+            try:
+                sx_size = await self._get_standx_position_size()
+                hb_size = await self._get_hibachi_position_size()
+            except Exception as e:
+                logger.warning("MANUAL: 포지션 조회 실패 (계속 대기): %s", e)
+                return
+
+            if sx_size <= 0.001 and hb_size <= 0.001:
+                logger.info("MANUAL_INTERVENTION: 양쪽 포지션 0 감지 → IDLE 복귀")
+                self._positions.pop("standx", None)
+                self._positions.pop("hibachi", None)
+                self._cycle_entered_at = None
+                self.state.cycle_entered_at = 0.0
+                self.state.current_direction = ""
+                self.state.exit_failure_count = 0
+                if self._current_cycle:
+                    self._current_cycle.exit_reason = "manual_intervention"
+                    self._current_cycle.exited_at = time.time()
+                    self._log_cycle(self._current_cycle)
+                    self._current_cycle = None
+                self.state.cycle_state = CycleState.IDLE
+                self._save_state()
+                await self.telegram.send_alert(
+                    "✅ 수동 청산 감지 → IDLE 복귀. 다음 분석 사이클부터 자동 거래 재개."
+                )
+                return
+
+            # 30분 쿨다운 reminder
+            if time.time() - self._last_warning_time > 1800:
+                self._last_warning_time = time.time()
+                await self.telegram.send_alert(
+                    f"⛔ 봇 정지 중 (MANUAL_INTERVENTION).\n"
+                    f"잔여: SX {sx_size:.3f} / HB {hb_size:.6f}\n"
+                    f"양쪽 포지션 모두 청산하시면 자동으로 IDLE 복귀하오."
+                )
 
     async def _recovery_check(self):
         """봇 재시작 시 기존 포지션 복구 — C6: Position 객체 재구성"""

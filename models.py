@@ -16,6 +16,9 @@ class CycleState(StrEnum):
     HOLD = "HOLD"
     EXIT = "EXIT"
     COOLDOWN = "COOLDOWN"
+    # 청산 N회 연속 실패 시 진입. 봇은 자동 청산 시도를 중단하고 사용자 개입 대기.
+    # 사용자가 수동 청산 후 봇 재시작 시 _recovery_check가 새 상태 결정.
+    MANUAL_INTERVENTION = "MANUAL_INTERVENTION"
 
 
 @dataclass
@@ -109,6 +112,8 @@ class BotState:
     # 4지점 잔고 측정용 (진짜 수수료 추적)
     balance_after_entry_total: float = 0.0  # T1: 진입 청크 완료 직후 잔고 합
     balance_before_exit_total: float = 0.0  # T2: 청산 시작 직전 잔고 합
+    # _execute_exit 연속 실패 카운터 — Config.MAX_EXIT_FAILURES 도달 시 MANUAL_INTERVENTION 전환
+    exit_failure_count: int = 0
 
     def to_dict(self) -> dict:
         d = asdict(self)

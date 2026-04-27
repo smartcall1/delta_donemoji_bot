@@ -51,6 +51,20 @@ class Config:
     MAKER_FILL_TIMEOUT_SECONDS: int = int(os.getenv("MAKER_FILL_TIMEOUT_SECONDS", "60"))
     MAKER_RETRY_LIMIT: int = int(os.getenv("MAKER_RETRY_LIMIT", "5"))
 
+    # 원금 회수 트리거 안전 마진 (USD) — spread MTM 회귀 변동성 buffer
+    # 0이면 MTM 일시 스파이크에 트리거 → 실제 청산 시점엔 손실 (2026-04-28 cycle 10 사건)
+    PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD: float = float(
+        os.getenv("PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD", "30")
+    )
+
+    # 청산 안전장치
+    # SX taker 시도마다 slippage escalation: 0.5% × (시도+1), 상한 EMERGENCY_CLOSE_SLIPPAGE_PCT
+    EMERGENCY_CLOSE_SLIPPAGE_PCT: float = float(
+        os.getenv("EMERGENCY_CLOSE_SLIPPAGE_PCT", "0.05")  # 5%
+    )
+    # _execute_exit가 N회 연속 실패하면 MANUAL_INTERVENTION 상태로 전환 (자동 재시도 중단)
+    MAX_EXIT_FAILURES: int = int(os.getenv("MAX_EXIT_FAILURES", "3"))
+
     # 텔레그램
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")

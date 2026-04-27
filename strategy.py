@@ -73,17 +73,25 @@ def is_opposite_direction_better(
 
 def should_exit_principal_recovered(
     current_total: float, init_total: float, notional: float, fee_per_fill: float,
+    safety_margin_usd: float = 0.0,
 ) -> bool:
     """원금 회수 청산 트리거.
-    현재 잔액 합이 (진입 시 잔액 + 청산 1회 수수료 buffer)에 도달하면 True.
-    펀딩 누적분이 진입수수료 + spread 노이즈 + 청산수수료까지 모두 회수했다는 의미.
-    MIN_HOLD 무관 발동 — Hibachi 거래량 회전이 목적이라 빨리 닫고 다시 진입.
+    현재 잔액(MTM 포함) ≥ 진입 잔액 + (청산 2-fill 수수료) + safety_margin_usd.
+
+    buffer 분해:
+      - 2 × fee_per_fill × notional: 청산은 HB maker(0%) + SX taker(0.04%) + maker 부족
+        시 HB taker(0.045%) fallback 가능 → 보수적으로 "fee_per_fill 2회분"으로 잡음.
+      - safety_margin_usd: spread MTM이 청산 진행 5~14분 동안 회귀할 수 있는 변동성 마진.
+        이 값이 0이면 MTM 스파이크 순간에 트리거가 발동되어 실제 청산 완료 시점엔
+        손실로 귀결될 수 있음. 일반적으로 notional×0.1% 또는 $30 이상 권장.
     """
-    threshold = init_total + notional * fee_per_fill
+    threshold = init_total + 2 * notional * fee_per_fill + safety_margin_usd
     if current_total >= threshold:
         logger.info(
-            "원금 회수 청산: total=$%.2f >= init+buffer=$%.2f (notional=$%.0f, fee=%.4f%%)",
-            current_total, threshold, notional, fee_per_fill * 100,
+            "원금 회수 청산: total=$%.2f >= threshold=$%.2f "
+            "(init=$%.2f + 2×fee=$%.2f + safety=$%.2f, notional=$%.0f)",
+            current_total, threshold, init_total,
+            2 * notional * fee_per_fill, safety_margin_usd, notional,
         )
         return True
     return False
