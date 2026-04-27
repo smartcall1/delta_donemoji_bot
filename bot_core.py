@@ -204,8 +204,8 @@ class DeltaNeutralBot:
             hb_filled = False
             hb_fill_price = hb_mark  # fallback
             for maker_attempt in range(Config.MAKER_RETRY_LIMIT):
-                # 시도마다 1bp씩 양보 (안 cross 보장 + 점차 적극적)
-                backoff = 0.0001 * (maker_attempt + 1)
+                # 시도마다 3bp씩 양보 (안 cross 보장 + 책 안쪽 깊이 박힘 → Hibachi 얇은 책 대응)
+                backoff = 0.0003 * (maker_attempt + 1)
                 if hibachi_side == "BUY":
                     hb_price = round(hb_mark * (1 - backoff), 2)
                 else:
@@ -571,8 +571,8 @@ class DeltaNeutralBot:
                     await asyncio.sleep(3)
                     continue
 
-                # 시도 횟수 증가에 따라 가격 양보 (1bp → 2bp → 3bp ...)
-                backoff = 0.0001 * (maker_attempt + 1)
+                # 시도 횟수 증가에 따라 가격 양보 (3bp → 6bp → 9bp ... 시도 5에 -15bp까지)
+                backoff = 0.0003 * (maker_attempt + 1)
                 if hb_close_side == "BUY":
                     hb_price = round(hb_mark * (1 - backoff), 2)
                 else:
