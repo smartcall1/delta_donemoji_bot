@@ -919,6 +919,13 @@ class DeltaNeutralBot:
                         entry_hb_price=hb_entry,
                         entry_spread=entry_spread,
                     )
+                    # 백필: _execute_enter 안에서 _current_cycle=None이라 못 박은 T0/T1 (Bug B fix)
+                    init_total_for_cycle = self._initial_standx_balance + self._initial_hibachi_balance
+                    t1_total_for_cycle = self.state.balance_after_entry_total
+                    if init_total_for_cycle > 0 and t1_total_for_cycle > 0:
+                        self._current_cycle.balance_t0_total = init_total_for_cycle
+                        self._current_cycle.balance_t1_total = t1_total_for_cycle
+                        self._current_cycle.actual_entry_cost = init_total_for_cycle - t1_total_for_cycle
                     self.state.cycle_state = CycleState.HOLD
                     self.state.weekly_hibachi_volume += notional
                     fee = notional * Config.FEE_PER_FILL
@@ -1018,7 +1025,9 @@ class DeltaNeutralBot:
                     if self._current_cycle:
                         self._current_cycle.exit_reason = "spread_opportunity"
                     await self.telegram.send_alert(
-                        f"💰 기회적 청산! 스프레드 수익 ${delta_sum:+,.1f}\n"
+                        f"💰 기회적 청산 트리거! spread MTM ${delta_sum:+,.1f}\n"
+                        f"⚠️ paper 값 — 진입/HOLD/청산 비용 미차감\n"
+                        f"실현 PnL은 청산 완료 메시지에서 확정\n"
                         f"(threshold ${Config.SPREAD_EXIT_THRESHOLD:.0f}, 보유 {hold_hours:.1f}h)"
                     )
                     self.state.cycle_state = CycleState.EXIT
