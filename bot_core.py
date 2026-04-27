@@ -167,9 +167,11 @@ class DeltaNeutralBot:
     async def _execute_enter(self, direction: str, notional: float) -> bool:
         """양쪽 분할 진입 — XEMM 패턴: Hibachi maker → fill 확인 → StandX taker.
 
-        실패 처리:
-        - Hibachi maker 미체결 → 1bp씩 양보하며 retry, MAKER_RETRY_LIMIT 초과 시 양쪽 taker fallback
-        - Hibachi 체결 후 StandX 실패 → 응급 Hibachi 즉시 청산 (방금 만든 노출 제거)
+        부분 체결 안전 처리 (Bug C fix, 2026-04-27):
+        - 각 maker 시도 직전에 hb 잔량 재조회 → 남은 양만 새로 발주 (중복 누적 방지)
+        - cancel 후 실측 size로 부분 체결분 정확히 인식 (가중평균 가격 누적)
+        - sx 헷지는 hb 실체결량(hb_actual_filled)에 정확히 매칭 — 청크 nominal qty 무시
+        - hb 부족분은 taker로 보충 후 sx 매칭 → 청크 종료 시 양측 사이즈 항상 동기화
         """
         standx_side, hibachi_side = self._parse_direction(direction)
         chunk_notional = notional / ENTRY_CHUNKS
@@ -196,15 +198,25 @@ class DeltaNeutralBot:
                 await asyncio.sleep(5)
                 continue
 
-            sx_qty = round(chunk_notional / sx_mark, 3)
-            hb_qty = round(chunk_notional / hb_mark, 6)
-
-            # ── Step 1: Hibachi maker (post_only) ──
+            hb_target = round(chunk_notional / hb_mark, 6)
             hb_size_before = await self._get_hibachi_position_size()
-            hb_filled = False
-            hb_fill_price = hb_mark  # fallback
+            sx_size_before = await self._get_standx_position_size()
+
+            # ── Step 1: Hibachi maker — 부분 체결 누적 인식, 시도마다 잔량 재계산 ──
+            hb_value_sum = 0.0  # 가중평균용: Σ(price × qty)
             for maker_attempt in range(Config.MAKER_RETRY_LIMIT):
-                # 시도마다 3bp씩 양보 (안 cross 보장 + 책 안쪽 깊이 박힘 → Hibachi 얇은 책 대응)
+                # 매 시도마다 잔량 재계산 — 이전 시도 부분 체결분 차감
+                cur_hb = await self._get_hibachi_position_size()
+                already_in_chunk = cur_hb - hb_size_before
+                hb_remaining = round(hb_target - already_in_chunk, 6)
+                if hb_remaining <= 0.0001:  # 사실상 다 채워짐
+                    logger.info(
+                        "Hibachi maker 청크 %d 충분히 체결, 메이커 단계 종료 (%.6f / %.6f)",
+                        chunk_idx + 1, already_in_chunk, hb_target,
+                    )
+                    break
+
+                # 시도마다 3bp씩 양보 (안 cross 보장 + 책 안쪽 깊이 박힘)
                 backoff = 0.0003 * (maker_attempt + 1)
                 if hibachi_side == "BUY":
                     hb_price = round(hb_mark * (1 - backoff), 2)
@@ -213,223 +225,204 @@ class DeltaNeutralBot:
 
                 try:
                     await self.hibachi.place_limit_order(
-                        Config.PAIR_HIBACHI, hibachi_side, hb_price, hb_qty, post_only=True,
+                        Config.PAIR_HIBACHI, hibachi_side, hb_price, hb_remaining, post_only=True,
                     )
                     logger.info(
-                        "Hibachi maker 청크 %d 발주 (시도 %d, %s @ %.2f, qty %.6f)",
-                        chunk_idx + 1, maker_attempt + 1, hibachi_side, hb_price, hb_qty,
+                        "Hibachi maker 청크 %d 발주 (시도 %d, %s @ %.2f, 잔량 %.6f)",
+                        chunk_idx + 1, maker_attempt + 1, hibachi_side, hb_price, hb_remaining,
                     )
                 except Exception as e:
                     logger.warning("Hibachi maker 발주 실패: %s", e)
                     await asyncio.sleep(3)
                     continue
 
+                # fill 대기 — 이번 시도분만 체크 (cur_hb 기준)
                 deadline = time.time() + Config.MAKER_FILL_TIMEOUT_SECONDS
+                full_attempt_fill = False
                 while time.time() < deadline:
                     await asyncio.sleep(5)
-                    cur_size = await self._get_hibachi_position_size()
-                    if cur_size >= hb_size_before + hb_qty * 0.95:
-                        logger.info(
-                            "Hibachi maker 청크 %d 체결: %.6f → %.6f",
-                            chunk_idx + 1, hb_size_before, cur_size,
-                        )
-                        hb_filled = True
-                        hb_fill_price = hb_price
+                    tick = await self._get_hibachi_position_size()
+                    if tick - cur_hb >= hb_remaining * 0.95:
+                        full_attempt_fill = True
                         break
 
-                # 미체결 주문 취소
+                # 미체결 주문 취소 — 이미 채워진 부분은 거래소에 그대로 남음
                 try:
                     await self.hibachi.cancel_all_orders()
                 except Exception:
                     pass
 
-                if hb_filled:
+                # 취소 후 실측 → 이번 시도에서 실제 채워진 양 (부분 체결 포함)
+                after_cancel = await self._get_hibachi_position_size()
+                attempt_filled = after_cancel - cur_hb
+                if attempt_filled > 0.0001:
+                    hb_value_sum += hb_price * attempt_filled
+                    logger.info(
+                        "Hibachi maker 청크 %d 시도 %d 체결: +%.6f @ %.2f (full=%s)",
+                        chunk_idx + 1, maker_attempt + 1, attempt_filled, hb_price, full_attempt_fill,
+                    )
+
+                if full_attempt_fill:
                     break
+
                 # 다음 시도용 mark 갱신
                 try:
                     hb_mark = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
                 except Exception:
                     pass
                 logger.info(
-                    "Hibachi maker 미체결, 재시도 (청크 %d 시도 %d/%d)",
+                    "Hibachi maker 부족분 남음, 재시도 (청크 %d 시도 %d/%d)",
                     chunk_idx + 1, maker_attempt + 1, Config.MAKER_RETRY_LIMIT,
                 )
 
-            # ── Step 2: 결과에 따른 분기 ──
-            if hb_filled:
-                # ── Step 2a: StandX taker — 반드시 성공해야 헷지 완성 ──
-                sx_size_before = await self._get_standx_position_size()
-                sx_done = False
-                sx_fill_price = sx_mark
-                for sx_attempt in range(Config.MAKER_RETRY_LIMIT * 2):
-                    # taker용 호가 (마크 ±0.4%)
-                    if standx_side == "BUY":
-                        sx_order_price = round(sx_mark * 1.004 / 0.1) * 0.1
-                    else:
-                        sx_order_price = round(sx_mark * 0.996 / 0.1) * 0.1
-                    sx_order_price = round(sx_order_price, 1)
+            # ── Step 2: maker 단계 종료 — 실측 hb 체결량 ──
+            after_maker = await self._get_hibachi_position_size()
+            hb_maker_filled = after_maker - hb_size_before
 
-                    try:
-                        await self.standx.place_limit_order(
-                            Config.PAIR_STANDX, standx_side, sx_order_price, sx_qty,
-                        )
-                    except Exception as e:
-                        logger.error("StandX taker 발주 실패 (시도 %d): %s", sx_attempt + 1, e)
-                        await asyncio.sleep(5)
-                        continue
-
-                    await asyncio.sleep(15)
-                    cur_sx = await self._get_standx_position_size()
-                    if cur_sx >= sx_size_before + sx_qty * 0.95:
-                        logger.info(
-                            "StandX taker 청크 %d 체결: %.3f → %.3f",
-                            chunk_idx + 1, sx_size_before, cur_sx,
-                        )
-                        sx_done = True
-                        sx_fill_price = sx_mark
-                        break
-
-                    try:
-                        await self.standx.cancel_all_orders(Config.PAIR_STANDX)
-                    except Exception:
-                        pass
-                    try:
-                        sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
-                        sx_mark = float(sx_market.get("mark_price", sx_mark))
-                    except Exception:
-                        pass
-                    logger.warning(
-                        "StandX taker 미체결, 재시도 (청크 %d 시도 %d)",
-                        chunk_idx + 1, sx_attempt + 1,
-                    )
-
-                if not sx_done:
-                    # 응급: Hibachi만 체결 → 즉시 되돌리기
-                    logger.error("🚨 청크 %d StandX 실패 → Hibachi 응급 청산", chunk_idx + 1)
-                    await self.telegram.send_alert(
-                        f"🚨 청크 {chunk_idx + 1}: StandX 진입 실패 → Hibachi 방금 체결분 응급 청산"
-                    )
-                    rollback_side = "SELL" if hibachi_side == "BUY" else "BUY"
-                    try:
-                        await self.hibachi.close_position(
-                            Config.PAIR_HIBACHI, rollback_side, hb_qty, slippage_pct=0.01,
-                        )
-                    except Exception as e:
-                        logger.error("Hibachi 응급 청산 실패: %s — 수동 개입 필요!", e)
-                        await self.telegram.send_alert(
-                            f"🚨🚨 Hibachi 응급 청산도 실패! 수동 개입 필요!"
-                        )
-                    break  # 진입 시도 중단
-
-                # 양쪽 모두 체결 — 이번 청크 완료
-                filled_notional += chunk_notional
-                avg_sx_price = (
-                    (avg_sx_price * (filled_notional - chunk_notional) + sx_fill_price * chunk_notional)
-                    / filled_notional if filled_notional > 0 else sx_fill_price
-                )
-                avg_hb_price = (
-                    (avg_hb_price * (filled_notional - chunk_notional) + hb_fill_price * chunk_notional)
-                    / filled_notional if filled_notional > 0 else hb_fill_price
-                )
-                logger.info(
-                    "XEMM 청크 %d/%d 체결 완료 (누적 $%.0f/$%.0f)",
-                    chunk_idx + 1, ENTRY_CHUNKS, filled_notional, notional,
-                )
-
-            else:
-                # ── Step 2b: Maker 모두 실패 → 양쪽 taker fallback ──
+            # ── Step 3: 부족분 taker 보충 ──
+            if hb_maker_filled < hb_target * 0.95:
+                hb_shortage = round(hb_target - hb_maker_filled, 6)
                 logger.warning(
-                    "청크 %d: Hibachi maker %d회 실패, taker fallback",
-                    chunk_idx + 1, Config.MAKER_RETRY_LIMIT,
+                    "청크 %d: maker 부족 (%.6f/%.6f) → taker 보충 %.6f",
+                    chunk_idx + 1, hb_maker_filled, hb_target, hb_shortage,
                 )
                 await self.telegram.send_alert(
-                    f"⚠️ 청크 {chunk_idx + 1} maker 실패, taker fallback"
+                    f"⚠️ 청크 {chunk_idx + 1} maker 부족 → taker 보충 {hb_shortage:.4f} ETH"
                 )
-
-                fallback_done = False
-                for retry in range(CHUNK_RETRY):
-                    try:
-                        sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
-                        sx_mark = float(sx_market.get("mark_price", sx_mark))
-                        hb_mark = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
-                    except Exception:
-                        await asyncio.sleep(5)
-                        continue
-
-                    if standx_side == "BUY":
-                        sx_order_price = round(sx_mark * 1.004 / 0.1) * 0.1
-                    else:
-                        sx_order_price = round(sx_mark * 0.996 / 0.1) * 0.1
-                    sx_order_price = round(sx_order_price, 1)
-                    if hibachi_side == "BUY":
-                        hb_order_price = round(hb_mark * 1.004, 2)
-                    else:
-                        hb_order_price = round(hb_mark * 0.996, 2)
-
-                    try:
-                        await self.standx.place_limit_order(
-                            Config.PAIR_STANDX, standx_side, sx_order_price, sx_qty,
-                        )
-                        await self.hibachi.place_limit_order(
-                            Config.PAIR_HIBACHI, hibachi_side, hb_order_price, hb_qty,
-                        )
-                    except Exception as e:
-                        logger.error("Taker fallback 발주 실패: %s", e)
-                        await asyncio.sleep(5)
-                        continue
-
-                    await asyncio.sleep(20)
-                    cur_sx = await self._get_standx_position_size()
-                    cur_hb = await self._get_hibachi_position_size()
-                    sx_ok = cur_sx >= sx_size_before + sx_qty * 0.95 if False else True  # noqa — 진입 시 사이즈 체크
-                    # 진입 시: 이전 사이즈 + 청크 ≥ 현재 사이즈 가까이
-                    # 단순화: 양쪽 모두 포지션 존재하면 OK
-                    has_sx = cur_sx > 1e-9
-                    has_hb = cur_hb > 1e-9
-
-                    if has_sx and has_hb:
-                        filled_notional += chunk_notional
-                        avg_sx_price = (
-                            (avg_sx_price * (filled_notional - chunk_notional) + sx_mark * chunk_notional)
-                            / filled_notional if filled_notional > 0 else sx_mark
-                        )
-                        avg_hb_price = (
-                            (avg_hb_price * (filled_notional - chunk_notional) + hb_mark * chunk_notional)
-                            / filled_notional if filled_notional > 0 else hb_mark
-                        )
-                        logger.info("Taker fallback 청크 %d 체결", chunk_idx + 1)
-                        fallback_done = True
-                        break
-
-                    # 편측 체결 롤백
-                    try:
-                        await self.standx.cancel_all_orders(Config.PAIR_STANDX)
-                    except Exception:
-                        pass
+                try:
+                    hb_mark_now = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
+                    hb_taker_price = round(
+                        hb_mark_now * (1.004 if hibachi_side == "BUY" else 0.996), 2
+                    )
+                    await self.hibachi.place_limit_order(
+                        Config.PAIR_HIBACHI, hibachi_side, hb_taker_price, hb_shortage,
+                    )
+                    await asyncio.sleep(8)
                     try:
                         await self.hibachi.cancel_all_orders()
                     except Exception:
                         pass
-                    if has_sx and not has_hb:
-                        try:
-                            await self.standx.close_position(
-                                Config.PAIR_STANDX, standx_side, sx_qty, slippage_pct=0.01,
-                            )
-                        except Exception:
-                            pass
-                    elif has_hb and not has_sx:
-                        try:
-                            rb = "SELL" if hibachi_side == "BUY" else "BUY"
-                            await self.hibachi.close_position(
-                                Config.PAIR_HIBACHI, rb, hb_qty, slippage_pct=0.01,
-                            )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(3)
+                    after_taker = await self._get_hibachi_position_size()
+                    taker_filled = after_taker - after_maker
+                    if taker_filled > 0.0001:
+                        hb_value_sum += hb_taker_price * taker_filled
+                except Exception as e:
+                    logger.error("Hibachi taker 보충 실패: %s", e)
 
-                if not fallback_done:
-                    logger.warning("청크 %d 실패, 분할 진입 중단", chunk_idx + 1)
+            # ── Step 4: 최종 hb 실체결량 산정 — 이게 sx 헷지 타겟 ──
+            final_hb = await self._get_hibachi_position_size()
+            hb_actual = final_hb - hb_size_before
+
+            if hb_actual <= 0.001:
+                logger.error("청크 %d: Hibachi 진입 0 → 청크 스킵", chunk_idx + 1)
+                await self.telegram.send_alert(
+                    f"⚠️ 청크 {chunk_idx + 1} Hibachi 0 체결 → 스킵, 다음 청크 진행"
+                )
+                continue
+
+            hb_chunk_avg = hb_value_sum / hb_actual if hb_actual > 0 else hb_mark
+
+            # ── Step 5: StandX taker — hb 실체결량과 동일 ETH 만큼 매칭 ──
+            sx_target = round(hb_actual, 3)
+            if sx_target <= 0.001:
+                logger.error(
+                    "청크 %d: hb 체결량 라운딩 후 sx 타겟 0 (hb=%.6f) → hb 응급 청산",
+                    chunk_idx + 1, hb_actual,
+                )
+                rollback_side = "SELL" if hibachi_side == "BUY" else "BUY"
+                try:
+                    await self.hibachi.close_position(
+                        Config.PAIR_HIBACHI, rollback_side, hb_actual, slippage_pct=0.01,
+                    )
+                except Exception as e:
+                    logger.error("응급 청산 실패: %s", e)
+                continue
+
+            sx_done = False
+            sx_fill_price = sx_mark
+            for sx_attempt in range(Config.MAKER_RETRY_LIMIT * 2):
+                cur_sx = await self._get_standx_position_size()
+                sx_remaining = round(sx_target - (cur_sx - sx_size_before), 3)
+                if sx_remaining <= 0.001:
+                    sx_done = True
                     break
+
+                if standx_side == "BUY":
+                    sx_order_price = round(sx_mark * 1.004 / 0.1) * 0.1
+                else:
+                    sx_order_price = round(sx_mark * 0.996 / 0.1) * 0.1
+                sx_order_price = round(sx_order_price, 1)
+
+                try:
+                    await self.standx.place_limit_order(
+                        Config.PAIR_STANDX, standx_side, sx_order_price, sx_remaining,
+                    )
+                except Exception as e:
+                    logger.error("StandX taker 발주 실패 (시도 %d): %s", sx_attempt + 1, e)
+                    await asyncio.sleep(5)
+                    continue
+
+                await asyncio.sleep(15)
+                cur_sx2 = await self._get_standx_position_size()
+                if cur_sx2 - sx_size_before >= sx_target * 0.98:
+                    logger.info(
+                        "StandX taker 청크 %d 매칭 완료: %.3f → %.3f (타겟 %.3f)",
+                        chunk_idx + 1, sx_size_before, cur_sx2, sx_target,
+                    )
+                    sx_done = True
+                    sx_fill_price = sx_mark
+                    break
+
+                try:
+                    await self.standx.cancel_all_orders(Config.PAIR_STANDX)
+                except Exception:
+                    pass
+                try:
+                    sx_market = await self.standx.get_market_price(Config.PAIR_STANDX)
+                    sx_mark = float(sx_market.get("mark_price", sx_mark))
+                except Exception:
+                    pass
+                logger.warning(
+                    "StandX taker 부족분 남음, 재시도 (청크 %d 시도 %d, 잔량 %.3f)",
+                    chunk_idx + 1, sx_attempt + 1, sx_remaining,
+                )
+
+            if not sx_done:
+                # 응급: hb 실체결량 만큼 응급 청산 (편측 노출 차단)
+                logger.error(
+                    "🚨 청크 %d StandX 매칭 실패 (hb %.6f) → Hibachi 응급 청산",
+                    chunk_idx + 1, hb_actual,
+                )
+                await self.telegram.send_alert(
+                    f"🚨 청크 {chunk_idx + 1}: StandX 매칭 실패 → Hibachi {hb_actual:.4f} ETH 응급 청산"
+                )
+                rollback_side = "SELL" if hibachi_side == "BUY" else "BUY"
+                try:
+                    await self.hibachi.close_position(
+                        Config.PAIR_HIBACHI, rollback_side, hb_actual, slippage_pct=0.01,
+                    )
+                except Exception as e:
+                    logger.error("Hibachi 응급 청산 실패: %s — 수동 개입 필요!", e)
+                    await self.telegram.send_alert(
+                        f"🚨🚨 Hibachi 응급 청산 실패! 수동 헷지 필요!"
+                    )
+                break  # 진입 시도 중단
+
+            # 청크 성공 — 실체결량 기준 notional 누적 (양쪽 동일량 보장)
+            chunk_filled = hb_actual * hb_chunk_avg
+            avg_sx_price = (
+                (avg_sx_price * filled_notional + sx_fill_price * chunk_filled)
+                / (filled_notional + chunk_filled) if (filled_notional + chunk_filled) > 0 else sx_fill_price
+            )
+            avg_hb_price = (
+                (avg_hb_price * filled_notional + hb_chunk_avg * chunk_filled)
+                / (filled_notional + chunk_filled) if (filled_notional + chunk_filled) > 0 else hb_chunk_avg
+            )
+            filled_notional += chunk_filled
+            logger.info(
+                "XEMM 청크 %d/%d 체결 완료 (hb=sx=%.6f ETH, $%.0f, 누적 $%.0f/$%.0f)",
+                chunk_idx + 1, ENTRY_CHUNKS, hb_actual, chunk_filled, filled_notional, notional,
+            )
 
         if filled_notional <= 0:
             await self.telegram.send_alert(f"🚨 분할 진입 전부 실패, IDLE 복귀")
@@ -543,24 +536,35 @@ class DeltaNeutralBot:
         for chunk_idx in range(EXIT_CHUNKS):
             chunks_left = EXIT_CHUNKS - chunk_idx
 
-            # 청크 시작 시 현재 잔량 재조회
-            hb_remaining = await self._get_hibachi_position_size()
-            sx_remaining = await self._get_standx_position_size()
-            if hb_remaining <= 1e-9 and sx_remaining <= 1e-9:
+            # 청크 시작 시 현재 잔량 재조회 — 이게 청산 진행 기준
+            hb_at_start = await self._get_hibachi_position_size()
+            sx_at_start = await self._get_standx_position_size()
+            if hb_at_start <= 0.001 and sx_at_start <= 0.001:
                 logger.info("청산 완료 (잔량 0) — 청크 %d 중단", chunk_idx + 1)
                 break
 
             is_last = (chunks_left == 1)
-            hb_qty = round(hb_remaining, 6) if is_last else round(hb_remaining / chunks_left, 6)
-            sx_qty = round(sx_remaining, 3) if is_last else round(sx_remaining / chunks_left, 3)
-            if hb_qty <= 0 or sx_qty <= 0:
-                logger.warning("청크 %d 수량 0, 스킵", chunk_idx + 1)
+            hb_target_close = (
+                round(hb_at_start, 6) if is_last
+                else round(hb_at_start / chunks_left, 6)
+            )
+            if hb_target_close <= 0:
+                logger.warning("청크 %d hb 청산량 0, sx만 잔여 시 다음 청크", chunk_idx + 1)
                 continue
 
-            # ── Step 1: Hibachi maker (post_only) ──
-            hb_size_before_chunk = hb_remaining
-            hb_filled = False
+            # ── Step 1: Hibachi maker — 부분 체결 누적 인식, 시도마다 잔량 재계산 ──
+            hb_value_sum = 0.0  # 가중평균용
             for maker_attempt in range(Config.MAKER_RETRY_LIMIT):
+                cur_hb = await self._get_hibachi_position_size()
+                already_closed_in_chunk = hb_at_start - cur_hb
+                hb_to_close = round(hb_target_close - already_closed_in_chunk, 6)
+                if hb_to_close <= 0.0001:
+                    logger.info(
+                        "Hibachi maker 청산 청크 %d 충분히 닫힘 (%.6f / %.6f)",
+                        chunk_idx + 1, already_closed_in_chunk, hb_target_close,
+                    )
+                    break
+
                 try:
                     hb_mark = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
                 except Exception as e:
@@ -580,139 +584,146 @@ class DeltaNeutralBot:
 
                 try:
                     await self.hibachi.place_limit_order(
-                        Config.PAIR_HIBACHI, hb_close_side, hb_price, hb_qty, post_only=True,
+                        Config.PAIR_HIBACHI, hb_close_side, hb_price, hb_to_close, post_only=True,
                     )
                     logger.info(
-                        "Hibachi maker 청크 %d 발주 (시도 %d, %s @ %.2f, qty %.6f)",
-                        chunk_idx + 1, maker_attempt + 1, hb_close_side, hb_price, hb_qty,
+                        "Hibachi maker 청산 청크 %d 발주 (시도 %d, %s @ %.2f, 잔량 %.6f)",
+                        chunk_idx + 1, maker_attempt + 1, hb_close_side, hb_price, hb_to_close,
                     )
                 except Exception as e:
                     logger.warning("Hibachi maker 발주 실패: %s", e)
                     await asyncio.sleep(3)
                     continue
 
-                # fill 대기 (timeout 내에서 사이즈 변화 polling)
+                # fill 대기 — 이번 시도분만 체크 (cur_hb 기준 감소량)
                 deadline = time.time() + Config.MAKER_FILL_TIMEOUT_SECONDS
+                full_attempt_fill = False
                 while time.time() < deadline:
                     await asyncio.sleep(5)
-                    cur_size = await self._get_hibachi_position_size()
-                    if cur_size <= hb_size_before_chunk - hb_qty * 0.95:
-                        logger.info(
-                            "Hibachi maker 청크 %d 체결 (시도 %d): %.6f → %.6f",
-                            chunk_idx + 1, maker_attempt + 1, hb_size_before_chunk, cur_size,
-                        )
-                        hb_filled = True
+                    tick = await self._get_hibachi_position_size()
+                    if cur_hb - tick >= hb_to_close * 0.95:
+                        full_attempt_fill = True
                         break
 
-                # 미체결 주문 정리
+                # 미체결분 cancel — 이미 체결된 부분은 거래소에 반영됨
                 try:
                     await self.hibachi.cancel_all_orders()
                 except Exception:
                     pass
 
-                if hb_filled:
+                # 취소 후 실측 → 이번 시도에서 실제 닫힌 양 (부분 체결 포함)
+                after_cancel = await self._get_hibachi_position_size()
+                attempt_closed = cur_hb - after_cancel
+                if attempt_closed > 0.0001:
+                    hb_value_sum += hb_price * attempt_closed
+                    logger.info(
+                        "Hibachi maker 청산 청크 %d 시도 %d 닫힘: -%.6f @ %.2f (full=%s)",
+                        chunk_idx + 1, maker_attempt + 1, attempt_closed, hb_price, full_attempt_fill,
+                    )
+
+                if full_attempt_fill:
                     break
+
                 logger.info(
-                    "Hibachi maker 미체결, 재시도 (청크 %d 시도 %d/%d, backoff %.2fbp)",
+                    "Hibachi maker 부족분 남음, 재시도 (청크 %d 시도 %d/%d, backoff %.2fbp)",
                     chunk_idx + 1, maker_attempt + 1, Config.MAKER_RETRY_LIMIT, backoff * 10000,
                 )
 
-            # ── Step 2: 결과에 따른 분기 ──
-            if hb_filled:
-                # ── Step 2a: StandX taker (응급 retry — 절대 편측 노출 안 됨) ──
-                sx_size_before_chunk = sx_remaining
-                sx_done = False
-                for sx_attempt in range(Config.MAKER_RETRY_LIMIT * 2):
-                    try:
-                        await self.standx.close_position(
-                            Config.PAIR_STANDX, sx_open_side, sx_qty, slippage_pct=0.005,
-                        )
-                    except Exception as e:
-                        logger.error("StandX taker 발주 실패 (시도 %d): %s", sx_attempt + 1, e)
-                        await asyncio.sleep(5)
-                        continue
+            # ── Step 2: maker 종료 → 부족분 taker 보충 ──
+            after_maker = await self._get_hibachi_position_size()
+            hb_maker_closed = hb_at_start - after_maker
 
-                    await asyncio.sleep(15)
-                    cur_sx = await self._get_standx_position_size()
-                    if cur_sx <= sx_size_before_chunk - sx_qty * 0.95:
-                        logger.info(
-                            "StandX taker 청크 %d 체결 (시도 %d): %.3f → %.3f",
-                            chunk_idx + 1, sx_attempt + 1, sx_size_before_chunk, cur_sx,
-                        )
-                        sx_done = True
-                        break
-
-                    try:
-                        await self.standx.cancel_all_orders(Config.PAIR_STANDX)
-                    except Exception:
-                        pass
-                    logger.warning(
-                        "StandX taker 미체결, 재시도 (청크 %d 시도 %d)",
-                        chunk_idx + 1, sx_attempt + 1,
-                    )
-
-                if not sx_done:
-                    logger.error("🚨 청크 %d: Hibachi 닫혔는데 StandX 미체결! 편측 노출!", chunk_idx + 1)
-                    await self.telegram.send_alert(
-                        f"🚨🚨 응급: 청크 {chunk_idx + 1} StandX 청산 실패 → 편측 노출!\n"
-                        f"수동 개입 필요. 봇은 진행 중단."
-                    )
-                    break
-
-                closed_chunks += 1
-
-            else:
-                # ── Step 2b: Maker 모두 실패 → 양쪽 taker fallback ──
+            if hb_maker_closed < hb_target_close * 0.95:
+                hb_shortage = round(hb_target_close - hb_maker_closed, 6)
                 logger.warning(
-                    "청크 %d: Hibachi maker %d회 실패, taker fallback",
-                    chunk_idx + 1, Config.MAKER_RETRY_LIMIT,
+                    "청산 청크 %d: maker 부족 (%.6f/%.6f) → taker 보충 %.6f",
+                    chunk_idx + 1, hb_maker_closed, hb_target_close, hb_shortage,
                 )
                 await self.telegram.send_alert(
-                    f"⚠️ 청크 {chunk_idx + 1} maker 실패, taker fallback"
+                    f"⚠️ 청산 청크 {chunk_idx + 1} maker 부족 → taker 보충 {hb_shortage:.4f} ETH"
+                )
+                try:
+                    await self.hibachi.close_position(
+                        Config.PAIR_HIBACHI,
+                        "BUY" if hb_close_side == "SELL" else "SELL",  # close_position 내부 flip
+                        hb_shortage, slippage_pct=0.005,
+                    )
+                    await asyncio.sleep(8)
+                except Exception as e:
+                    logger.error("Hibachi taker 보충 실패: %s", e)
+
+            # ── Step 3: 최종 hb 실청산량 → sx 매칭 타겟 ──
+            final_hb = await self._get_hibachi_position_size()
+            hb_actual_closed = hb_at_start - final_hb
+
+            if hb_actual_closed <= 0.001:
+                logger.error("청산 청크 %d: Hibachi 0 청산", chunk_idx + 1)
+                await self.telegram.send_alert(
+                    f"⚠️ 청산 청크 {chunk_idx + 1} Hibachi 0 → 다음 청크 진행"
+                )
+                continue
+
+            # ── Step 4: StandX taker — hb 실청산량과 동일 ETH 매칭 ──
+            sx_target_close = round(hb_actual_closed, 3)
+            if sx_target_close <= 0.001:
+                logger.warning(
+                    "청산 청크 %d: hb %.6f 청산 후 sx 타겟 라운딩 0", chunk_idx + 1, hb_actual_closed,
+                )
+                continue
+
+            sx_done = False
+            for sx_attempt in range(Config.MAKER_RETRY_LIMIT * 2):
+                cur_sx = await self._get_standx_position_size()
+                sx_already_closed = sx_at_start - cur_sx
+                sx_to_close = round(sx_target_close - sx_already_closed, 3)
+                if sx_to_close <= 0.001:
+                    sx_done = True
+                    break
+
+                try:
+                    await self.standx.close_position(
+                        Config.PAIR_STANDX, sx_open_side, sx_to_close, slippage_pct=0.005,
+                    )
+                except Exception as e:
+                    logger.error("StandX taker 발주 실패 (시도 %d): %s", sx_attempt + 1, e)
+                    await asyncio.sleep(5)
+                    continue
+
+                await asyncio.sleep(15)
+                cur_sx2 = await self._get_standx_position_size()
+                if sx_at_start - cur_sx2 >= sx_target_close * 0.98:
+                    logger.info(
+                        "StandX taker 청산 청크 %d 매칭 완료: %.3f → %.3f (-%.3f)",
+                        chunk_idx + 1, sx_at_start, cur_sx2, sx_target_close,
+                    )
+                    sx_done = True
+                    break
+
+                try:
+                    await self.standx.cancel_all_orders(Config.PAIR_STANDX)
+                except Exception:
+                    pass
+                logger.warning(
+                    "StandX taker 부족분 남음, 재시도 (청산 청크 %d 시도 %d, 잔량 %.3f)",
+                    chunk_idx + 1, sx_attempt + 1, sx_to_close,
                 )
 
-                fallback_done = False
-                for retry in range(CHUNK_RETRY):
-                    try:
-                        await self.hibachi.close_position(
-                            Config.PAIR_HIBACHI,
-                            "BUY" if hb_close_side == "SELL" else "SELL",  # close_position 내부 flip
-                            hb_qty, slippage_pct=0.005,
-                        )
-                        await self.standx.close_position(
-                            Config.PAIR_STANDX, sx_open_side, sx_qty, slippage_pct=0.005,
-                        )
-                    except Exception as e:
-                        logger.error("Taker fallback 발주 실패: %s", e)
-                        await asyncio.sleep(5)
-                        continue
+            if not sx_done:
+                logger.error(
+                    "🚨 청산 청크 %d: hb %.6f 청산했는데 StandX 미체결! 편측 노출!",
+                    chunk_idx + 1, hb_actual_closed,
+                )
+                await self.telegram.send_alert(
+                    f"🚨🚨 응급: 청산 청크 {chunk_idx + 1} hb {hb_actual_closed:.4f} 청산 → "
+                    f"StandX 매칭 실패! 편측 노출. 수동 개입 필요. 봇은 진행 중단."
+                )
+                break
 
-                    await asyncio.sleep(15)
-                    cur_hb = await self._get_hibachi_position_size()
-                    cur_sx = await self._get_standx_position_size()
-                    if (cur_hb <= hb_remaining - hb_qty * 0.95
-                            and cur_sx <= sx_remaining - sx_qty * 0.95):
-                        logger.info("Taker fallback 청크 %d 체결", chunk_idx + 1)
-                        fallback_done = True
-                        break
-
-                    try:
-                        await self.standx.cancel_all_orders(Config.PAIR_STANDX)
-                    except Exception:
-                        pass
-                    try:
-                        await self.hibachi.cancel_all_orders()
-                    except Exception:
-                        pass
-
-                if fallback_done:
-                    closed_chunks += 1
-                else:
-                    logger.error("청크 %d: maker + taker 모두 실패", chunk_idx + 1)
-                    await self.telegram.send_alert(
-                        f"🚨 청크 {chunk_idx + 1} maker+taker 모두 실패. 수동 개입!"
-                    )
-                    break
+            closed_chunks += 1
+            logger.info(
+                "XEMM 청산 청크 %d/%d 완료 (hb=sx=%.6f ETH 청산)",
+                chunk_idx + 1, EXIT_CHUNKS, hb_actual_closed,
+            )
 
         # ── 최종 검증 ──
         sx_still_size = await self._get_standx_position_size()
