@@ -38,6 +38,19 @@ class Config:
     STANDX_MAINTENANCE_MARGIN: float = 0.0125
     HIBACHI_MAINTENANCE_MARGIN: float = 0.0467
 
+    # 거래 수수료
+    STANDX_TAKER_FEE: float = 0.0004    # 0.04%
+    HIBACHI_TAKER_FEE: float = 0.00045  # 0.045% (Tier 1, 14일 누적 < $5M)
+    HIBACHI_MAKER_FEE: float = 0.0      # Hibachi maker 무료
+    # 구식: 양쪽 taker 합 (참고용)
+    LEGACY_BOTH_TAKER_FEE: float = STANDX_TAKER_FEE + HIBACHI_TAKER_FEE  # 0.085%
+    # XEMM 실행 모드 — Hibachi maker(0%) + StandX taker(0.04%). entry/exit 1회 비용.
+    FEE_PER_FILL: float = STANDX_TAKER_FEE + HIBACHI_MAKER_FEE  # 0.04%
+
+    # XEMM 실행 파라미터
+    MAKER_FILL_TIMEOUT_SECONDS: int = int(os.getenv("MAKER_FILL_TIMEOUT_SECONDS", "60"))
+    MAKER_RETRY_LIMIT: int = int(os.getenv("MAKER_RETRY_LIMIT", "5"))
+
     # 텔레그램
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")

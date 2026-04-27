@@ -16,12 +16,14 @@ BTN_DETAIL = "🔍 Detail"
 BTN_HISTORY = "📋 History"
 BTN_FUNDING = "💰 Funding"
 BTN_REBALANCE = "🔄 Rebalance"
+BTN_FORCE_EXIT = "🔚 Close Now"
 BTN_STOP = "⏹ Stop"
 
 KEYBOARD = {
     "keyboard": [
         [BTN_STATUS, BTN_DETAIL, BTN_HISTORY],
-        [BTN_FUNDING, BTN_REBALANCE, BTN_STOP],
+        [BTN_FUNDING, BTN_REBALANCE],
+        [BTN_FORCE_EXIT, BTN_STOP],
     ],
     "resize_keyboard": True,
     "is_persistent": True,

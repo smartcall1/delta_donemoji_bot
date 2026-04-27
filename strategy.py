@@ -71,6 +71,24 @@ def is_opposite_direction_better(
     return False
 
 
+def should_exit_principal_recovered(
+    current_total: float, init_total: float, notional: float, fee_per_fill: float,
+) -> bool:
+    """원금 회수 청산 트리거.
+    현재 잔액 합이 (진입 시 잔액 + 청산 1회 수수료 buffer)에 도달하면 True.
+    펀딩 누적분이 진입수수료 + spread 노이즈 + 청산수수료까지 모두 회수했다는 의미.
+    MIN_HOLD 무관 발동 — Hibachi 거래량 회전이 목적이라 빨리 닫고 다시 진입.
+    """
+    threshold = init_total + notional * fee_per_fill
+    if current_total >= threshold:
+        logger.info(
+            "원금 회수 청산: total=$%.2f >= init+buffer=$%.2f (notional=$%.0f, fee=%.4f%%)",
+            current_total, threshold, notional, fee_per_fill * 100,
+        )
+        return True
+    return False
+
+
 def should_exit_spread(delta_sum: float, threshold: float) -> bool:
     """스프레드 MTM이 threshold 이상이면 기회적 청산 트리거.
     MIN_HOLD 무관 — 수익 조건만 판단."""
