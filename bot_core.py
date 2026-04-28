@@ -25,6 +25,7 @@ import time
 import logging
 import asyncio
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 from config import Config
 from models import CycleState, BotState, Position, Cycle, FundingSnapshot
@@ -488,6 +489,30 @@ class DeltaNeutralBot:
             logger.warning("StandX 포지션 조회 실패: %s", e)
         return 0.0
 
+    # ── strict 버전: API 실패 시 None / 포지션 없음은 0.0 (cycle 11 사고 방지) ──
+    # 청산 / 검증 / emergency 분기 등 거짓 0이 치명적인 분기점에서 사용한다.
+    async def _get_hibachi_position_size_strict(self) -> Optional[float]:
+        try:
+            positions = await self.hibachi.get_positions()
+        except Exception as e:
+            logger.warning("Hibachi 포지션 조회 실패 (strict): %s", e)
+            return None
+        for p in positions:
+            if p.get("symbol") == Config.PAIR_HIBACHI:
+                return abs(float(p.get("quantity", p.get("size", p.get("position_size", 0)))))
+        return 0.0
+
+    async def _get_standx_position_size_strict(self) -> Optional[float]:
+        try:
+            positions = await self.standx.get_positions()
+        except Exception as e:
+            logger.warning("StandX 포지션 조회 실패 (strict): %s", e)
+            return None
+        for p in positions:
+            if p.get("symbol") == Config.PAIR_STANDX:
+                return abs(float(p.get("qty", p.get("position_size", p.get("size", 0)))))
+        return 0.0
+
     async def _execute_exit(self) -> bool:
         """양쪽 분할 청산 — XEMM 패턴: Hibachi maker → fill 확인 → StandX taker.
 
@@ -537,8 +562,21 @@ class DeltaNeutralBot:
             chunks_left = EXIT_CHUNKS - chunk_idx
 
             # 청크 시작 시 현재 잔량 재조회 — 이게 청산 진행 기준
-            hb_at_start = await self._get_hibachi_position_size()
-            sx_at_start = await self._get_standx_position_size()
+            # 패치 B (cycle 11 사고): strict 사용 → API 실패 시 None.
+            # 거짓 0으로 hb_target_close=0 만들어 SX 청산까지 헛스킵하던 버그 차단.
+            hb_at_start = await self._get_hibachi_position_size_strict()
+            sx_at_start = await self._get_standx_position_size_strict()
+            if hb_at_start is None or sx_at_start is None:
+                logger.error(
+                    "청크 %d: 포지션 조회 실패 (hb=%s, sx=%s) → 청산 abort, EXIT 재시도로 복귀",
+                    chunk_idx + 1, hb_at_start, sx_at_start,
+                )
+                await self.telegram.send_alert(
+                    f"⚠️ 청산 청크 {chunk_idx + 1}: 거래소 API 응답 불가 → 청산 보류, "
+                    f"메모리/포지션 보존 (거짓 데이터 회피)."
+                )
+                return False
+
             if hb_at_start <= 0.001 and sx_at_start <= 0.001:
                 logger.info("청산 완료 (잔량 0) — 청크 %d 중단", chunk_idx + 1)
                 break
@@ -768,8 +806,21 @@ class DeltaNeutralBot:
             )
 
         # ── 최종 검증 ──
-        sx_still_size = await self._get_standx_position_size()
-        hb_still_size = await self._get_hibachi_position_size()
+        # 패치 C (cycle 11 사고): strict 사용 → API 실패 시 None.
+        # 거짓 0으로 self._positions.pop("hibachi") 실행되어 메모리 객체 손실 +
+        # 다음 EXIT 재시도가 "청산 대상 포지션 없음"으로 즉시 실패하던 버그 차단.
+        sx_still_size = await self._get_standx_position_size_strict()
+        hb_still_size = await self._get_hibachi_position_size_strict()
+        if sx_still_size is None or hb_still_size is None:
+            logger.error(
+                "XEMM 청산 후 포지션 조회 실패 (sx=%s, hb=%s) → 메모리 보존 + EXIT 재시도",
+                sx_still_size, hb_still_size,
+            )
+            await self.telegram.send_alert(
+                "⚠️ 청산 후 거래소 API 응답 불가 → 메모리 보존, EXIT 재시도."
+            )
+            return False
+
         sx_still = sx_still_size > 1e-9
         hb_still = hb_still_size > 1e-9
 
@@ -1262,11 +1313,18 @@ class DeltaNeutralBot:
             # 봇은 자동 청산을 시도하지 않고 사용자 개입을 기다린다.
             # 30분마다 한 번 알림을 보내 사용자에게 잊지 않도록 reminder.
             # 사용자가 양쪽 거래소 포지션을 수동 청산하면 자동으로 IDLE 복귀 (포지션 0 감지).
-            try:
-                sx_size = await self._get_standx_position_size()
-                hb_size = await self._get_hibachi_position_size()
-            except Exception as e:
-                logger.warning("MANUAL: 포지션 조회 실패 (계속 대기): %s", e)
+            # 패치 (cycle 11 사고): strict 사용 → 거짓 0으로 IDLE 자동 복귀 차단.
+            sx_size = await self._get_standx_position_size_strict()
+            hb_size = await self._get_hibachi_position_size_strict()
+            if sx_size is None or hb_size is None:
+                logger.warning("MANUAL: 포지션 조회 실패 (sx=%s, hb=%s) → 계속 대기",
+                               sx_size, hb_size)
+                if time.time() - self._last_warning_time > 1800:
+                    self._last_warning_time = time.time()
+                    await self.telegram.send_alert(
+                        "⛔ MANUAL_INTERVENTION + 거래소 API 응답 불가.\n"
+                        "잔량 확인 불가 — 거래소에서 직접 양쪽 잔량 확인 부탁드리오."
+                    )
                 return
 
             if sx_size <= 0.001 and hb_size <= 0.001:
@@ -1797,6 +1855,24 @@ class DeltaNeutralBot:
                         if (self._consecutive_api_failures >= API_FAIL_EMERGENCY_THRESHOLD
                                 and self.state.cycle_state == CycleState.HOLD
                                 and self._positions):
+                            # 패치 D (cycle 11 사고): API 깨진 상태에서 청산 시도 자체 차단.
+                            # 깨진 API → 거짓 0 → 청크 헛스킵 → pop으로 메모리 손실 → EXIT 무한 실패 →
+                            # 사용자 패닉 수동 청산까지 이어진 사고 재발 방지.
+                            sx_chk = await self._get_standx_position_size_strict()
+                            hb_chk = await self._get_hibachi_position_size_strict()
+                            if sx_chk is None or hb_chk is None:
+                                logger.error(
+                                    "API 깨짐 + HOLD → 자동 청산 보류 + MANUAL_INTERVENTION (sx=%s, hb=%s)",
+                                    sx_chk, hb_chk,
+                                )
+                                self.state.cycle_state = CycleState.MANUAL_INTERVENTION
+                                await self.telegram.send_alert(
+                                    f"⛔ API {self._consecutive_api_failures}회 연속 실패 + 거래소 응답 불가.\n"
+                                    f"자동 청산 보류 (거짓 데이터로 더 큰 사고 위험) → MANUAL_INTERVENTION.\n"
+                                    f"API 회복 후 자동 재개. 거래소에서 양쪽 포지션 직접 확인 권장."
+                                )
+                                self._save_state()
+                                continue
                             await self.telegram.send_alert(
                                 f"🚨 API {self._consecutive_api_failures}회 연속 실패! "
                                 f"포지션 감시 불가 — 긴급 청산 실행!"
