@@ -109,9 +109,15 @@ class DeltaNeutralBot:
         self.state.save(os.path.join(Config.LOG_DIR, "bot_state.json"))
 
     def _on_standx_price(self, price: float):
+        if price > 1e10:
+            logger.warning("StandX 센티넬 가격 감지: $%.4g — 무시", price)
+            return
         self.standx_price = price
 
     def _on_hibachi_price(self, price: float):
+        if price > 1e10:
+            logger.warning("Hibachi 센티넬 가격 감지: $%.4g — 무시", price)
+            return
         self.hibachi_price = price
 
     @staticmethod
@@ -198,6 +204,14 @@ class DeltaNeutralBot:
                 logger.error("가격 정보 없음 (sx=%.2f, hb=%.2f)", sx_mark, hb_mark)
                 await asyncio.sleep(5)
                 continue
+            if sx_mark > 1e10 or hb_mark > 1e10:
+                logger.warning("센티넬 가격 감지 (sx=%.4g, hb=%.4g) — 스킵", sx_mark, hb_mark)
+                await asyncio.sleep(5)
+                continue
+            price_ratio = max(sx_mark, hb_mark) / min(sx_mark, hb_mark)
+            if price_ratio > 2.0:
+                logger.warning("가격 괴리 %.1fx (sx=$%.2f hb=$%.2f) — 청크 중단", price_ratio, sx_mark, hb_mark)
+                break
 
             hb_target = round(chunk_notional / hb_mark, 6)
             hb_size_before = await self._get_hibachi_position_size()
@@ -359,10 +373,9 @@ class DeltaNeutralBot:
                     "청크 %d: hb 체결량 라운딩 후 sx 타겟 0 (hb=%.6f) → hb 응급 청산",
                     chunk_idx + 1, hb_actual,
                 )
-                rollback_side = "SELL" if hibachi_side == "BUY" else "BUY"
                 try:
                     await self.hibachi.close_position(
-                        Config.PAIR_HIBACHI, rollback_side, hb_actual, slippage_pct=0.01,
+                        Config.PAIR_HIBACHI, hibachi_side, hb_actual, slippage_pct=0.01,
                     )
                 except Exception as e:
                     logger.error("응급 청산 실패: %s", e)
@@ -426,10 +439,9 @@ class DeltaNeutralBot:
                 await self.telegram.send_alert(
                     f"🚨 청크 {chunk_idx + 1}: StandX 매칭 실패 → Hibachi {hb_actual:.4f} ETH 응급 청산"
                 )
-                rollback_side = "SELL" if hibachi_side == "BUY" else "BUY"
                 try:
                     await self.hibachi.close_position(
-                        Config.PAIR_HIBACHI, rollback_side, hb_actual, slippage_pct=0.01,
+                        Config.PAIR_HIBACHI, hibachi_side, hb_actual, slippage_pct=0.01,
                     )
                 except Exception as e:
                     logger.error("Hibachi 응급 청산 실패: %s — 수동 개입 필요!", e)
