@@ -129,6 +129,19 @@ class HibachiClient:
             return float(result.get("markPrice", result.get("mark_price", 0)))
         return 0.0
 
+    async def get_bbo(self, symbol: str) -> dict:
+        result = await _retry(self._get_prices_raw, symbol)
+        bid = ask = mark = 0.0
+        if hasattr(result, "markPrice"):
+            mark = float(result.markPrice)
+            bid = float(getattr(result, "bidPrice", 0) or 0)
+            ask = float(getattr(result, "askPrice", 0) or 0)
+        elif isinstance(result, dict):
+            mark = float(result.get("markPrice", result.get("mark_price", 0)))
+            bid = float(result.get("bidPrice", result.get("bid_price", 0)))
+            ask = float(result.get("askPrice", result.get("ask_price", 0)))
+        return {"bid": bid, "ask": ask, "mark": mark}
+
     async def get_funding_rate(self, symbol: str) -> float:
         # 펀딩레이트는 get_prices의 fundingRateEstimation에 있음 (get_stats에는 없음!)
         result = await _retry(self._get_prices_raw, symbol)

@@ -217,12 +217,39 @@ class DeltaNeutralBot:
                     )
                     break
 
-                # 시도마다 3bp씩 양보 (안 cross 보장 + 책 안쪽 깊이 박힘)
-                backoff = 0.0003 * (maker_attempt + 1)
-                if hibachi_side == "BUY":
-                    hb_price = round(hb_mark * (1 - backoff), 2)
+                # ── BBO 기반 가격 산출 (bid/ask 큐 최전방 진입) ──
+                try:
+                    bbo = await self.hibachi.get_bbo(Config.PAIR_HIBACHI)
+                    bbo_bid, bbo_ask, bbo_mark = bbo["bid"], bbo["ask"], bbo["mark"]
+                    bbo_spread = bbo_ask - bbo_bid if bbo_bid > 0 and bbo_ask > 0 else 0
+                    hb_mark = bbo_mark
+                except Exception as e:
+                    logger.warning("BBO 조회 실패, mark fallback: %s", e)
+                    bbo_bid = bbo_ask = 0.0
+                    bbo_spread = 0.0
+
+                if bbo_bid > 0 and bbo_ask > 0:
+                    # BBO 유효 → bid/ask에 직접 붙이되, 재시도마다 $0.01씩 유리한 방향
+                    if hibachi_side == "BUY":
+                        hb_price = round(bbo_bid + 0.01 * maker_attempt, 2)
+                        if hb_price >= bbo_ask:
+                            hb_price = round(bbo_ask - 0.01, 2)
+                    else:
+                        hb_price = round(bbo_ask - 0.01 * maker_attempt, 2)
+                        if hb_price <= bbo_bid:
+                            hb_price = round(bbo_bid + 0.01, 2)
                 else:
-                    hb_price = round(hb_mark * (1 + backoff), 2)
+                    # BBO 없음 → mark 기준 1bp backoff (기존보다 축소)
+                    backoff = 0.0001 * (maker_attempt + 1)
+                    if hibachi_side == "BUY":
+                        hb_price = round(hb_mark * (1 - backoff), 2)
+                    else:
+                        hb_price = round(hb_mark * (1 + backoff), 2)
+
+                logger.info(
+                    "Hibachi maker 가격: %.2f (bid=%.2f ask=%.2f spread=$%.2f, 시도 %d)",
+                    hb_price, bbo_bid, bbo_ask, bbo_spread, maker_attempt + 1,
+                )
 
                 try:
                     await self.hibachi.place_limit_order(
@@ -266,11 +293,7 @@ class DeltaNeutralBot:
                 if full_attempt_fill:
                     break
 
-                # 다음 시도용 mark 갱신
-                try:
-                    hb_mark = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
-                except Exception:
-                    pass
+                # mark 갱신은 루프 상단 BBO 진단에서 수행됨
                 logger.info(
                     "Hibachi maker 부족분 남음, 재시도 (청크 %d 시도 %d/%d)",
                     chunk_idx + 1, maker_attempt + 1, Config.MAKER_RETRY_LIMIT,
@@ -291,7 +314,13 @@ class DeltaNeutralBot:
                     f"⚠️ 청크 {chunk_idx + 1} maker 부족 → taker 보충 {hb_shortage:.4f} ETH"
                 )
                 try:
-                    hb_mark_now = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
+                    taker_bbo = await self.hibachi.get_bbo(Config.PAIR_HIBACHI)
+                    hb_mark_now = taker_bbo["mark"]
+                    logger.info(
+                        "[BBO 진단] taker 보충 시점: bid=%.2f ask=%.2f mark=%.2f spread=$%.2f",
+                        taker_bbo["bid"], taker_bbo["ask"], hb_mark_now,
+                        taker_bbo["ask"] - taker_bbo["bid"] if taker_bbo["bid"] > 0 and taker_bbo["ask"] > 0 else 0,
+                    )
                     hb_taker_price = round(
                         hb_mark_now * (1.004 if hibachi_side == "BUY" else 0.996), 2
                     )
