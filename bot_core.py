@@ -645,29 +645,41 @@ class DeltaNeutralBot:
                     break
 
                 try:
-                    hb_mark = await self.hibachi.get_mark_price(Config.PAIR_HIBACHI)
+                    bbo = await self.hibachi.get_bbo(Config.PAIR_HIBACHI)
+                    bbo_bid, bbo_ask, hb_mark = bbo["bid"], bbo["ask"], bbo["mark"]
                 except Exception as e:
-                    logger.warning("Hibachi mark 조회 실패: %s", e)
+                    logger.warning("Hibachi BBO 조회 실패: %s", e)
                     await asyncio.sleep(3)
                     continue
                 if hb_mark <= 0:
                     await asyncio.sleep(3)
                     continue
 
-                # 시도 횟수 증가에 따라 가격 양보 (3bp → 6bp → 9bp ... 시도 5에 -15bp까지)
-                backoff = 0.0003 * (maker_attempt + 1)
-                if hb_close_side == "BUY":
-                    hb_price = round(hb_mark * (1 - backoff), 2)
+                # BBO 큐 최전방에 붙이되, 재시도마다 $0.01씩 양보 (진입과 동일 로직)
+                if bbo_bid > 0 and bbo_ask > 0:
+                    if hb_close_side == "BUY":
+                        hb_price = round(bbo_bid + 0.01 * maker_attempt, 2)
+                        if hb_price >= bbo_ask:
+                            hb_price = round(bbo_ask - 0.01, 2)
+                    else:
+                        hb_price = round(bbo_ask - 0.01 * maker_attempt, 2)
+                        if hb_price <= bbo_bid:
+                            hb_price = round(bbo_bid + 0.01, 2)
                 else:
-                    hb_price = round(hb_mark * (1 + backoff), 2)
+                    # BBO 없음 → mark 기준 3bp backoff
+                    backoff = 0.0003 * (maker_attempt + 1)
+                    if hb_close_side == "BUY":
+                        hb_price = round(hb_mark * (1 - backoff), 2)
+                    else:
+                        hb_price = round(hb_mark * (1 + backoff), 2)
 
                 try:
                     await self.hibachi.place_limit_order(
                         Config.PAIR_HIBACHI, hb_close_side, hb_price, hb_to_close, post_only=True,
                     )
                     logger.info(
-                        "Hibachi maker 청산 청크 %d 발주 (시도 %d, %s @ %.2f, 잔량 %.6f)",
-                        chunk_idx + 1, maker_attempt + 1, hb_close_side, hb_price, hb_to_close,
+                        "Hibachi maker 청산 청크 %d 발주 (시도 %d, %s @ %.2f, bid=%.2f ask=%.2f, 잔량 %.6f)",
+                        chunk_idx + 1, maker_attempt + 1, hb_close_side, hb_price, bbo_bid, bbo_ask, hb_to_close,
                     )
                 except Exception as e:
                     logger.warning("Hibachi maker 발주 실패: %s", e)
@@ -1568,11 +1580,11 @@ class DeltaNeutralBot:
 
                 # ── 청산 트리거 진행 ──
                 # 실제 봇 청산 조건(should_exit_principal_recovered)과 동일:
-                # total ≥ init_total + 2×fee + SAFETY_MARGIN
+                # total ≥ init_total + 1×fee + SAFETY_MARGIN
                 notional = (sx_pos.notional if sx_pos else hb_pos.notional)
                 if init_total > 0 and notional > 0:
                     realized_cycle = total - init_total
-                    close_fee_buffer = 2 * notional * Config.FEE_PER_FILL
+                    close_fee_buffer = notional * Config.FEE_PER_FILL
                     safety = Config.PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD
                     trigger_threshold = init_total + close_fee_buffer + safety
                     gap = trigger_threshold - total

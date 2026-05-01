@@ -76,22 +76,19 @@ def should_exit_principal_recovered(
     safety_margin_usd: float = 0.0,
 ) -> bool:
     """원금 회수 청산 트리거.
-    현재 잔액(MTM 포함) ≥ 진입 잔액 + (청산 2-fill 수수료) + safety_margin_usd.
+    현재 잔액(MTM 포함) ≥ 진입 잔액 + 청산 수수료 + safety_margin_usd.
 
     buffer 분해:
-      - 2 × fee_per_fill × notional: 청산은 HB maker(0%) + SX taker(0.04%) + maker 부족
-        시 HB taker(0.045%) fallback 가능 → 보수적으로 "fee_per_fill 2회분"으로 잡음.
-      - safety_margin_usd: spread MTM이 청산 진행 5~14분 동안 회귀할 수 있는 변동성 마진.
-        이 값이 0이면 MTM 스파이크 순간에 트리거가 발동되어 실제 청산 완료 시점엔
-        손실로 귀결될 수 있음. 일반적으로 notional×0.1% 또는 $30 이상 권장.
+      - 1 × fee_per_fill × notional: 청산은 HB maker(0%) + SX taker(0.04%) = 0.04%
+      - safety_margin_usd: spread MTM이 청산 진행 중 회귀할 수 있는 변동성 마진.
     """
-    threshold = init_total + 2 * notional * fee_per_fill + safety_margin_usd
+    threshold = init_total + notional * fee_per_fill + safety_margin_usd
     if current_total >= threshold:
         logger.info(
             "원금 회수 청산: total=$%.2f >= threshold=$%.2f "
-            "(init=$%.2f + 2×fee=$%.2f + safety=$%.2f, notional=$%.0f)",
+            "(init=$%.2f + fee=$%.2f + safety=$%.2f, notional=$%.0f)",
             current_total, threshold, init_total,
-            2 * notional * fee_per_fill, safety_margin_usd, notional,
+            notional * fee_per_fill, safety_margin_usd, notional,
         )
         return True
     return False
