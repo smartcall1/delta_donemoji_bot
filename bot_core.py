@@ -1567,23 +1567,23 @@ class DeltaNeutralBot:
                 lines.append(f"   임계 ±{Config.FUNDING_COST_THRESHOLD}")
 
                 # ── 청산 트리거 진행 ──
-                # 트리거: total ≥ init_total + (notional × FEE_PER_FILL)
-                # 잔고는 이미 MTM equity이므로 spread MTM이 자연스럽게 포함됨.
-                # buffer는 청산 시 새로 나갈 수수료 (XEMM: StandX taker 0.04%만).
+                # 실제 봇 청산 조건(should_exit_principal_recovered)과 동일:
+                # total ≥ init_total + 2×fee + SAFETY_MARGIN
                 notional = (sx_pos.notional if sx_pos else hb_pos.notional)
                 if init_total > 0 and notional > 0:
                     realized_cycle = total - init_total
-                    close_fee_buffer = notional * Config.FEE_PER_FILL
-                    trigger_threshold = init_total + close_fee_buffer
+                    close_fee_buffer = 2 * notional * Config.FEE_PER_FILL
+                    safety = Config.PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD
+                    trigger_threshold = init_total + close_fee_buffer + safety
                     gap = trigger_threshold - total
 
                     real_emoji = "🟢" if realized_cycle >= 0 else "🔴"
                     lines.append("")
                     if gap <= 0:
-                        lines.append(f"🎯 청산 트리거 도달! (다음 틱 청산)")
+                        lines.append(f"🎯 원금회수 청산 임박! (다음 틱 청산 가능)")
                     else:
-                        lines.append(f"🎯 청산 트리거: +${gap:,.2f} 남음")
-                        lines.append(f"   (목표 ${trigger_threshold:,.2f} = 진입 + 수수료 ${close_fee_buffer:.2f})")
+                        lines.append(f"🎯 원금회수까지: +${gap:,.2f} 남음")
+                        lines.append(f"   (목표 ${trigger_threshold:,.2f} = 진입 + 청산fee ${close_fee_buffer:.2f} + 안전마진 ${safety:.0f})")
                     lines.append(
                         f"{real_emoji} 잔고 변화 {realized_cycle:+,.2f} "
                         f"(펀딩 누적 + spread MTM ${spread_mtm:+,.2f} − 진입 수수료)"
