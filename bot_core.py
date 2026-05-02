@@ -232,6 +232,7 @@ class DeltaNeutralBot:
                     break
 
                 # ── BBO 기반 가격 산출 (bid/ask 큐 최전방 진입) ──
+                backoff = 0.0
                 try:
                     bbo = await self.hibachi.get_bbo(Config.PAIR_HIBACHI)
                     bbo_bid, bbo_ask, bbo_mark = bbo["bid"], bbo["ask"], bbo["mark"]
@@ -656,6 +657,7 @@ class DeltaNeutralBot:
                     continue
 
                 # BBO 큐 최전방에 붙이되, 재시도마다 $0.01씩 양보 (진입과 동일 로직)
+                backoff = 0.0
                 if bbo_bid > 0 and bbo_ask > 0:
                     if hb_close_side == "BUY":
                         hb_price = round(bbo_bid + 0.01 * maker_attempt, 2)
