@@ -52,9 +52,11 @@ class Config:
     MAKER_RETRY_LIMIT: int = int(os.getenv("MAKER_RETRY_LIMIT", "5"))
 
     # 원금 회수 트리거 안전 마진 (USD) — spread MTM 회귀 변동성 buffer
+    # 포인트 파밍 우선 전략: 수수료 커버 즉시 청산 → 사이클 회전 극대화
     # 0이면 MTM 일시 스파이크에 트리거 → 실제 청산 시점엔 손실 (2026-04-28 cycle 10 사건)
+    # 10 미만은 MTM 노이즈에 허위 트리거 위험 — 최소 10 권장
     PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD: float = float(
-        os.getenv("PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD", "30")
+        os.getenv("PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD", "15")
     )
 
     # 청산 안전장치
