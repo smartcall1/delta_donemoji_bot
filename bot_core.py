@@ -1522,11 +1522,15 @@ class DeltaNeutralBot:
             return agg
 
         async def on_status(cb):
-            """🅰️ Glanceable Status — 모바일 한 화면, 한 줄 22자 이내"""
+            """📊 Unified Status — 3봇 통일 포맷"""
             state = self.state.cycle_state
             lines = []
 
-            # ── 헤더: 상태 + 경과시간 + MIN_HOLD 통과 표시 ──
+            # ── 페어 심볼 추출 (ETH-USD → ETH) ──
+            pair_raw = Config.PAIR_STANDX  # e.g. "ETH-USD"
+            pair_symbol = pair_raw.split("-")[0] if "-" in pair_raw else pair_raw
+
+            # ── 헤더: 📊 STATE · PAIR · 보유 X.Xh [badge] ──
             if state == CycleState.HOLD and self._cycle_entered_at:
                 hold_h = (time.time() - self._cycle_entered_at) / 3600
                 if hold_h >= Config.MIN_HOLD_HOURS:
@@ -1535,75 +1539,103 @@ class DeltaNeutralBot:
                     remain = Config.MIN_HOLD_HOURS - hold_h
                     badge = f"⏰{remain:.1f}h남음"
                 lines.append(
-                    f"📊 #{self.state.current_cycle_id} HOLD {hold_h:.1f}h {badge}"
+                    f"📊 #{self.state.current_cycle_id} HOLD"
+                    f" · {pair_symbol} · 보유 {hold_h:.1f}h {badge}"
                 )
             elif state == CycleState.COOLDOWN and self._cooldown_until:
                 remaining = max(0.0, (self._cooldown_until - time.time()) / 3600)
-                lines.append(f"📊 COOLDOWN {remaining:.1f}h 남음")
+                lines.append(
+                    f"📊 COOLDOWN · {pair_symbol} · {remaining:.1f}h 남음"
+                )
             else:
-                lines.append(f"📊 {state.value}")
+                lines.append(f"📊 {state.value} · {pair_symbol}")
 
-            # ── 방향 표시 (포지션 있을 때만) ──
+            # ── 방향 (🎯 MODE) ──
             sx_pos = self._positions.get("standx") if self._positions else None
             hb_pos = self._positions.get("hibachi") if self._positions else None
-            if sx_pos:
-                color = "🟢" if sx_pos.side == "LONG" else "🔴"
-                lines.append(f"{color} StandX {sx_pos.side}")
-            if hb_pos:
-                color = "🟢" if hb_pos.side == "LONG" else "🔴"
-                lines.append(f"{color} Hibachi {hb_pos.side}")
-            if (sx_pos and not hb_pos) or (hb_pos and not sx_pos):
-                lines.append("⚠️ 편측 포지션!")
+            if sx_pos and hb_pos:
+                lines.append(
+                    f"🎯 S {sx_pos.side} / H {hb_pos.side}"
+                )
+            elif sx_pos:
+                lines.append(f"🎯 S {sx_pos.side} ⚠️ 편측!")
+            elif hb_pos:
+                lines.append(f"🎯 H {hb_pos.side} ⚠️ 편측!")
+            lines.append("━━━━━━━━━━━━━━━━")
 
-            # ── 손익 ──
+            # ── 손익 블록 ──
             total = self.state.standx_balance + self.state.hibachi_balance
             init_total = self._initial_standx_balance + self._initial_hibachi_balance
-            lines.append("")
-            lines.append(f"💰 ${total:,.2f}")
             if init_total > 0:
                 pnl = total - init_total
                 pct = pnl / init_total * 100
-                emoji = "🟢" if pnl >= 0 else "🔴"
-                lines.append(f"{emoji} ${pnl:+,.2f} ({pct:+.2f}%)")
-                lines.append(f"진입 ${init_total:,.2f}")
+                pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                lines.append(
+                    f"💰 ${total:,.2f} {pnl_emoji} ${pnl:+,.2f} ({pct:+.2f}%)"
+                )
+                lines.append(
+                    f"   (S ${self.state.standx_balance:,.2f}"
+                    f" / H ${self.state.hibachi_balance:,.2f})"
+                )
+                lines.append(f"   진입 ${init_total:,.2f}")
 
-            # ── 마진 / 펀딩 rate (모니터링) + 사이클 분해 (HOLD 활성 시) ──
-            if (sx_pos and hb_pos
-                    and self.standx_price > 0 and self.hibachi_price > 0):
-                sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
-                hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
-                sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
-                hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
-                spread_mtm = sx_pnl + hb_pnl
-                lines.append("")
-                lines.append(f"🏦 마진 {sx_margin:.0f}% / {hb_margin:.0f}%")
-                lines.append(f"⏳ 펀딩 rate {self._cumulative_funding_cost:+.3f}")
-                lines.append(f"   임계 ±{Config.FUNDING_COST_THRESHOLD}")
-
-                # ── 청산 트리거 진행 ──
-                # 실제 봇 청산 조건(should_exit_principal_recovered)과 동일:
-                # total ≥ init_total + 1×fee + SAFETY_MARGIN
-                notional = (sx_pos.notional if sx_pos else hb_pos.notional)
-                if init_total > 0 and notional > 0:
-                    realized_cycle = total - init_total
+                # ── 익절/손절 게이지 ──
+                notional = 0.0
+                if sx_pos:
+                    notional = sx_pos.notional
+                elif hb_pos:
+                    notional = hb_pos.notional
+                if notional > 0:
                     close_fee_buffer = notional * Config.FEE_PER_FILL
                     safety = Config.PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD
                     trigger_threshold = init_total + close_fee_buffer + safety
                     gap = trigger_threshold - total
-
-                    real_emoji = "🟢" if realized_cycle >= 0 else "🔴"
-                    lines.append("")
                     if gap <= 0:
-                        lines.append(f"🎯 원금회수 청산 임박! (다음 틱 청산 가능)")
+                        lines.append(f"   🎯 익절 도달! (다음 틱 청산 가능)")
                     else:
-                        lines.append(f"🎯 원금회수까지: +${gap:,.2f} 남음")
-                        lines.append(f"   (목표 ${trigger_threshold:,.2f} = 진입 + 청산fee ${close_fee_buffer:.2f} + 안전마진 ${safety:.0f})")
-                    lines.append(
-                        f"{real_emoji} 잔고 변화 {realized_cycle:+,.2f} "
-                        f"(펀딩 누적 + spread MTM ${spread_mtm:+,.2f} − 진입 수수료)"
-                    )
+                        lines.append(f"   🎯 익절까지 ${gap:,.2f}")
+                    # 손절 기준: 마진 비상 수준
+                    sl_pct = Config.MARGIN_EMERGENCY_PCT
+                    lines.append(f"   📐 손절 마진 {sl_pct:.0f}% 이하")
+            else:
+                lines.append(f"💰 ${total:,.2f}")
+                lines.append(
+                    f"   (S ${self.state.standx_balance:,.2f}"
+                    f" / H ${self.state.hibachi_balance:,.2f})"
+                )
 
-            # ── 누적 realized ──
+            # ── 헷지 포지션 상세 ──
+            if sx_pos and hb_pos and self.standx_price > 0 and self.hibachi_price > 0:
+                sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
+                hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
+                spread_mtm = sx_pnl + hb_pnl
+                delta_emoji = "⚖️" if abs(spread_mtm) < 5 else ("📈" if spread_mtm > 0 else "📉")
+                lines.append("")
+                lines.append(f"📍 헷지 {delta_emoji}")
+                # StandX 라인
+                sx_pnl_pct = (sx_pnl / sx_pos.notional * 100) if sx_pos.notional else 0.0
+                lines.append(
+                    f"   S {sx_pos.side}  ${sx_pos.notional:,.0f}"
+                    f"  {sx_pnl_pct:+.2f}%"
+                )
+                # Hibachi 라인
+                hb_pnl_pct = (hb_pnl / hb_pos.notional * 100) if hb_pos.notional else 0.0
+                lines.append(
+                    f"   H {hb_pos.side}  ${hb_pos.notional:,.0f}"
+                    f"  {hb_pnl_pct:+.2f}%"
+                )
+
+                # ── 마진 / 펀딩 ──
+                sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
+                hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
+                lines.append("")
+                lines.append(f"🏦 마진 S{sx_margin:.0f}% / H{hb_margin:.0f}%")
+                lines.append(
+                    f"⏳ 펀딩 {self._cumulative_funding_cost:+.3f}"
+                    f" (임계 ±{Config.FUNDING_COST_THRESHOLD})"
+                )
+
+            # ── 누적 (realized) ──
             agg = _aggregate_realized()
             lines.append("")
             lines.append("━ 누적 (realized) ━")
@@ -1616,9 +1648,6 @@ class DeltaNeutralBot:
                 lines.append("🌱 cycle 8부터 누적 시작")
             pct_v = self.state.weekly_hibachi_volume / 1000.0
             lines.append(f"📦 거래량 {pct_v:.0f}% / $100K")
-
-            lines.append("")
-            lines.append("<i>🔍 자세히 → Detail 버튼</i>")
 
             await self.telegram.send_main_menu("\n".join(lines))
 

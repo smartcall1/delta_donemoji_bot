@@ -12,18 +12,22 @@ logger = logging.getLogger(__name__)
 
 # 전역 하단 고정 버튼 텍스트
 BTN_STATUS = "📊 Status"
-BTN_DETAIL = "🔍 Detail"
-BTN_HISTORY = "📋 History"
 BTN_FUNDING = "💰 Funding"
-BTN_REBALANCE = "🔄 Rebalance"
+BTN_HISTORY = "📋 History"
+BTN_DETAIL = "🔍 Detail"
+BTN_RESYNC = "🔄 Resync"
 BTN_FORCE_EXIT = "🔚 Close Now"
 BTN_STOP = "⏹ Stop"
 
+# legacy alias — 기존 핸들러 호환
+BTN_REBALANCE = BTN_RESYNC
+
 KEYBOARD = {
     "keyboard": [
-        [BTN_STATUS, BTN_DETAIL, BTN_HISTORY],
-        [BTN_FUNDING, BTN_REBALANCE],
+        [BTN_STATUS, BTN_FUNDING],
+        [BTN_HISTORY, BTN_RESYNC],
         [BTN_FORCE_EXIT, BTN_STOP],
+        [BTN_DETAIL],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
