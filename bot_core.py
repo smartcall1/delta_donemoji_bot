@@ -1237,6 +1237,11 @@ class DeltaNeutralBot:
                     self._current_cycle.exit_reason = exit_reason
                 self.state.cycle_state = CycleState.EXIT
                 self._save_state()
+                pair = self.state.pair or "?"
+                await self._telegram.send_alert(
+                    f"[🔔 EXIT 결정] {pair} | {exit_reason} | "
+                    f"보유 {hold_hours:.1f}h, 마진 {worst_margin:.1f}%"
+                )
 
         elif state == CycleState.EXIT:
             success = await self._execute_exit()
