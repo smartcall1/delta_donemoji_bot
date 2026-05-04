@@ -876,8 +876,8 @@ class DeltaNeutralBot:
             )
             return False
 
-        sx_still = sx_still_size > 1e-9
-        hb_still = hb_still_size > 1e-9
+        sx_still = sx_still_size > 0.001
+        hb_still = hb_still_size > 0.001
 
         if not sx_still:
             self._positions.pop("standx", None)
@@ -886,7 +886,7 @@ class DeltaNeutralBot:
 
         if sx_still or hb_still:
             logger.error(
-                "XEMM 청산 후 잔여 포지션: sx=%.3f hb=%.6f", sx_still_size, hb_still_size,
+                "XEMM 청산 후 잔여 포지션: sx=%.6f hb=%.6f", sx_still_size, hb_still_size,
             )
             return False
 
