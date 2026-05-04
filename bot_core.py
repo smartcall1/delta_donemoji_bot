@@ -1527,12 +1527,13 @@ class DeltaNeutralBot:
             """📊 Unified Status — 3봇 통일 포맷"""
             state = self.state.cycle_state
             lines = []
+            THIN = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+            BOLD = "━━━━━━━━━━━━━━━━"
 
-            # ── 페어 심볼 추출 (ETH-USD → ETH) ──
-            pair_raw = Config.PAIR_STANDX  # e.g. "ETH-USD"
+            pair_raw = Config.PAIR_STANDX
             pair_symbol = pair_raw.split("-")[0] if "-" in pair_raw else pair_raw
 
-            # ── 헤더: 📊 STATE · PAIR · 보유 X.Xh [badge] ──
+            hold_h = 0.0
             if state == CycleState.HOLD and self._cycle_entered_at:
                 hold_h = (time.time() - self._cycle_entered_at) / 3600
                 if hold_h >= Config.MIN_HOLD_HOURS:
@@ -1552,20 +1553,16 @@ class DeltaNeutralBot:
             else:
                 lines.append(f"📊 {state.value} · {pair_symbol}")
 
-            # ── 방향 (🎯 MODE) ──
             sx_pos = self._positions.get("standx") if self._positions else None
             hb_pos = self._positions.get("hibachi") if self._positions else None
             if sx_pos and hb_pos:
-                lines.append(
-                    f"🎯 S {sx_pos.side} / H {hb_pos.side}"
-                )
+                lines.append(f"🎯 S {sx_pos.side} / H {hb_pos.side}")
             elif sx_pos:
                 lines.append(f"🎯 S {sx_pos.side} ⚠️ 편측!")
             elif hb_pos:
                 lines.append(f"🎯 H {hb_pos.side} ⚠️ 편측!")
-            lines.append("━━━━━━━━━━━━━━━━")
+            lines.append(BOLD)
 
-            # ── 손익 블록 ──
             total = self.state.standx_balance + self.state.hibachi_balance
             init_total = self._initial_standx_balance + self._initial_hibachi_balance
             if init_total > 0:
@@ -1581,7 +1578,6 @@ class DeltaNeutralBot:
                 )
                 lines.append(f"   진입 ${init_total:,.2f}")
 
-                # ── 익절/손절 게이지 ──
                 notional = 0.0
                 if sx_pos:
                     notional = sx_pos.notional
@@ -1592,13 +1588,11 @@ class DeltaNeutralBot:
                     safety = Config.PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD
                     trigger_threshold = init_total + close_fee_buffer + safety
                     gap = trigger_threshold - total
-                    if gap <= 0:
-                        lines.append(f"   🎯 익절 도달! (다음 틱 청산 가능)")
-                    else:
-                        lines.append(f"   🎯 익절까지 ${gap:,.2f}")
-                    # 손절 기준: 마진 비상 수준
                     sl_pct = Config.MARGIN_EMERGENCY_PCT
-                    lines.append(f"   📐 손절 마진 {sl_pct:.0f}% 이하")
+                    if gap <= 0:
+                        lines.append(f"   🎯 익절 도달! / 📐 손절 마진 {sl_pct:.0f}%")
+                    else:
+                        lines.append(f"   🎯 익절까지 ${gap:,.2f} / 📐 손절 마진 {sl_pct:.0f}%")
             else:
                 lines.append(f"💰 ${total:,.2f}")
                 lines.append(
@@ -1606,41 +1600,55 @@ class DeltaNeutralBot:
                     f" / H ${self.state.hibachi_balance:,.2f})"
                 )
 
-            # ── 헷지 포지션 상세 ──
             if sx_pos and hb_pos and self.standx_price > 0 and self.hibachi_price > 0:
+                lines.append(THIN)
                 sx_pnl = sx_pos.calc_unrealized_pnl(self.standx_price)
                 hb_pnl = hb_pos.calc_unrealized_pnl(self.hibachi_price)
                 spread_mtm = sx_pnl + hb_pnl
                 delta_emoji = "⚖️" if abs(spread_mtm) < 5 else ("📈" if spread_mtm > 0 else "📉")
-                lines.append("")
                 lines.append(f"📍 헷지 {delta_emoji}")
-                # StandX 라인
                 sx_pnl_pct = (sx_pnl / sx_pos.notional * 100) if sx_pos.notional else 0.0
                 lines.append(
                     f"   S {sx_pos.side}  ${sx_pos.notional:,.0f}"
                     f"  {sx_pnl_pct:+.2f}%"
                 )
-                # Hibachi 라인
                 hb_pnl_pct = (hb_pnl / hb_pos.notional * 100) if hb_pos.notional else 0.0
                 lines.append(
                     f"   H {hb_pos.side}  ${hb_pos.notional:,.0f}"
                     f"  {hb_pnl_pct:+.2f}%"
                 )
-
-                # ── 마진 / 펀딩 ──
                 sx_margin = sx_pos.calc_margin_ratio(self.standx_price)
                 hb_margin = hb_pos.calc_margin_ratio(self.hibachi_price)
-                lines.append("")
                 lines.append(f"🏦 마진 S{sx_margin:.0f}% / H{hb_margin:.0f}%")
+
+                lines.append(THIN)
+                try:
+                    sx_data = await self.standx.get_funding_rate(Config.PAIR_STANDX)
+                    sx_fr = float(sx_data.get("funding_rate", 0))
+                    hb_fr = await self.hibachi.get_funding_rate(Config.PAIR_HIBACHI)
+                    rate_diff = sx_fr - hb_fr
+                    apr = rate_diff * (365 * 24 / 8) * 100
+                    apr_emoji = "🟢" if apr >= 0 else "🔴"
+                    lines.append(f"📈 펀딩 APR {apr_emoji} {apr:+.1f}%")
+                    lines.append(f"   8h S {sx_fr:+.6f} / H {hb_fr:+.6f}")
+                except Exception:
+                    lines.append("📈 펀딩 APR ⚠️ 조회 실패")
                 lines.append(
-                    f"⏳ 펀딩 {self._cumulative_funding_cost:+.3f}"
+                    f"   누적 비용 ${self._cumulative_funding_cost:+.3f}"
                     f" (임계 ±{Config.FUNDING_COST_THRESHOLD})"
                 )
 
-            # ── 누적 (realized) ──
+            if state == CycleState.HOLD and self._cycle_entered_at:
+                lines.append(THIN)
+                min_remaining_h = max(0, Config.MIN_HOLD_HOURS - hold_h)
+                max_remaining_d = max(0, Config.MAX_HOLD_DAYS - hold_h / 24)
+                if min_remaining_h > 0:
+                    lines.append(f"⏳ 최소 {min_remaining_h:.1f}h · 만기 {max_remaining_d:.1f}일")
+                else:
+                    lines.append(f"⏳ 만기 {max_remaining_d:.1f}일")
+
+            lines.append(BOLD)
             agg = _aggregate_realized()
-            lines.append("")
-            lines.append("━ 누적 (realized) ━")
             if agg["count"] > 0:
                 emoji = "🟢" if agg["pnl"] >= 0 else "🔴"
                 lines.append(
