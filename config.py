@@ -32,7 +32,7 @@ class Config:
     FUNDING_COST_THRESHOLD: float = float(os.getenv("FUNDING_COST_THRESHOLD", "0.001"))
     SPREAD_EXIT_THRESHOLD: float = float(os.getenv("SPREAD_EXIT_THRESHOLD", "120"))
     # 3x 레버리지 기준: 시작 33%, 청산 ~5% (Hibachi 4.67%, StandX 1.25%)
-    MARGIN_WARNING_PCT: float = float(os.getenv("MARGIN_WARNING_PCT", "15"))
+    MARGIN_WARNING_PCT: float = float(os.getenv("MARGIN_WARNING_PCT", "12"))
     MARGIN_EMERGENCY_PCT: float = float(os.getenv("MARGIN_EMERGENCY_PCT", "10"))
 
     STANDX_MAINTENANCE_MARGIN: float = 0.0125
