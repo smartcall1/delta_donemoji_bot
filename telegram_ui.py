@@ -14,20 +14,22 @@ logger = logging.getLogger(__name__)
 BTN_STATUS = "📊 Status"
 BTN_FUNDING = "💰 Funding"
 BTN_HISTORY = "📋 History"
-BTN_DETAIL = "🔍 Detail"
-BTN_RESYNC = "🔄 Resync"
+BTN_POSITIONS = "📌 Positions"
 BTN_FORCE_EXIT = "🔚 Close Now"
 BTN_STOP = "⏹ Stop"
+BTN_KILL = "💀 Kill"
 
 # legacy alias — 기존 핸들러 호환
-BTN_REBALANCE = BTN_RESYNC
+BTN_DETAIL = BTN_POSITIONS
+BTN_RESYNC = BTN_FORCE_EXIT
+BTN_REBALANCE = BTN_FORCE_EXIT
 
 KEYBOARD = {
     "keyboard": [
         [BTN_STATUS, BTN_FUNDING],
-        [BTN_HISTORY, BTN_RESYNC],
+        [BTN_HISTORY, BTN_POSITIONS],
         [BTN_FORCE_EXIT, BTN_STOP],
-        [BTN_DETAIL],
+        [BTN_KILL],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -49,6 +51,22 @@ class TelegramUI:
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+    async def flush_pending_updates(self):
+        """봇 오프라인 동안 쌓인 대기 업데이트 전부 무시 (Stop 누적 방지)"""
+        if not self.enabled:
+            return
+        await self._ensure_session()
+        try:
+            params = {"offset": -1, "timeout": 0}
+            async with self._session.get(f"{self.base}/getUpdates", params=params) as resp:
+                data = await resp.json()
+                results = data.get("result", [])
+                if results:
+                    self._offset = results[-1]["update_id"] + 1
+                    logger.info("텔레그램 대기 업데이트 %d건 flush", len(results))
+        except Exception as e:
+            logger.debug("텔레그램 flush 실패 (무시): %s", e)
 
     async def close(self):
         if self._session and not self._session.closed:

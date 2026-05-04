@@ -187,7 +187,7 @@ class DeltaNeutralBot:
         avg_hb_price = 0.0
 
         await self.telegram.send_alert(
-            f"📦 XEMM 분할 진입 시작: ${notional:,.0f} ÷ {ENTRY_CHUNKS} = ${chunk_notional:,.0f}/청크"
+            f"<b>[📦 XEMM ENTER]</b> ${notional:,.0f} ÷ {ENTRY_CHUNKS} = ${chunk_notional:,.0f}/청크"
         )
 
         for chunk_idx in range(ENTRY_CHUNKS):
@@ -326,7 +326,7 @@ class DeltaNeutralBot:
                     chunk_idx + 1, hb_maker_filled, hb_target, hb_shortage,
                 )
                 await self.telegram.send_alert(
-                    f"⚠️ 청크 {chunk_idx + 1} maker 부족 → taker 보충 {hb_shortage:.4f} ETH"
+                    f"<b>[⚠️ CHUNK {chunk_idx + 1}]</b> maker 부족 → taker 보충 {hb_shortage:.4f} ETH"
                 )
                 try:
                     taker_bbo = await self.hibachi.get_bbo(Config.PAIR_HIBACHI)
@@ -361,7 +361,7 @@ class DeltaNeutralBot:
             if hb_actual <= 0.001:
                 logger.error("청크 %d: Hibachi 진입 0 → 청크 스킵", chunk_idx + 1)
                 await self.telegram.send_alert(
-                    f"⚠️ 청크 {chunk_idx + 1} Hibachi 0 체결 → 스킵, 다음 청크 진행"
+                    f"<b>[⚠️ CHUNK {chunk_idx + 1}]</b> Hibachi 0 체결 → 스킵, 다음 청크 진행"
                 )
                 continue
 
@@ -438,7 +438,7 @@ class DeltaNeutralBot:
                     chunk_idx + 1, hb_actual,
                 )
                 await self.telegram.send_alert(
-                    f"🚨 청크 {chunk_idx + 1}: StandX 매칭 실패 → Hibachi {hb_actual:.4f} ETH 응급 청산"
+                    f"<b>[🚨 CHUNK {chunk_idx + 1}]</b> StandX 매칭 실패 → Hibachi {hb_actual:.4f} ETH 응급 청산"
                 )
                 try:
                     await self.hibachi.close_position(
@@ -447,7 +447,7 @@ class DeltaNeutralBot:
                 except Exception as e:
                     logger.error("Hibachi 응급 청산 실패: %s — 수동 개입 필요!", e)
                     await self.telegram.send_alert(
-                        f"🚨🚨 Hibachi 응급 청산 실패! 수동 헷지 필요!"
+                        f"<b>[🚨 EMERGENCY]</b> Hibachi 응급 청산 실패. 수동 헷지 필요합니다"
                     )
                 break  # 진입 시도 중단
 
@@ -468,7 +468,7 @@ class DeltaNeutralBot:
             )
 
         if filled_notional <= 0:
-            await self.telegram.send_alert(f"🚨 분할 진입 전부 실패, IDLE 복귀")
+            await self.telegram.send_alert(f"<b>[🚨 ERROR]</b> 분할 진입 전부 실패, IDLE 복귀")
             return False
 
         margin = filled_notional / Config.LEVERAGE
@@ -485,7 +485,7 @@ class DeltaNeutralBot:
             leverage=Config.LEVERAGE, margin=margin,
         )
         await self.telegram.send_alert(
-            f"✅ 분할 진입 완료: ${filled_notional:,.0f}/${notional:,.0f} "
+            f"<b>[✅ XEMM ENTER]</b> ${filled_notional:,.0f}/${notional:,.0f} 완료 "
             f"({ENTRY_CHUNKS}청크 중 {int(filled_notional / chunk_notional)}개 체결)"
         )
 
@@ -595,8 +595,8 @@ class DeltaNeutralBot:
         hb_initial = await self._get_hibachi_position_size() or (hb_pos.notional / hb_pos.entry_price)
 
         await self.telegram.send_alert(
-            f"📦 XEMM 분할 청산 시작: {EXIT_CHUNKS}청크\n"
-            f"Hibachi {hb_initial:.6f} (maker) / StandX {sx_initial:.3f} (taker)"
+            f"<b>[📦 XEMM EXIT]</b> {EXIT_CHUNKS}청크\n"
+            f"HB {hb_initial:.6f} (maker) / SX {sx_initial:.3f} (taker)"
         )
 
         closed_chunks = 0
@@ -614,8 +614,8 @@ class DeltaNeutralBot:
                     chunk_idx + 1, hb_at_start, sx_at_start,
                 )
                 await self.telegram.send_alert(
-                    f"⚠️ 청산 청크 {chunk_idx + 1}: 거래소 API 응답 불가 → 청산 보류, "
-                    f"메모리/포지션 보존 (거짓 데이터 회피)."
+                    f"<b>[⚠️ CHUNK {chunk_idx + 1}]</b> 거래소 API 응답 불가 → 청산 보류, "
+                    f"메모리/포지션 보존 (거짓 데이터 회피)"
                 )
                 return False
 
@@ -733,7 +733,7 @@ class DeltaNeutralBot:
                     chunk_idx + 1, hb_maker_closed, hb_target_close, hb_shortage,
                 )
                 await self.telegram.send_alert(
-                    f"⚠️ 청산 청크 {chunk_idx + 1} maker 부족 → taker 보충 {hb_shortage:.4f} ETH"
+                    f"<b>[⚠️ CHUNK {chunk_idx + 1}]</b> 청산 maker 부족 → taker 보충 {hb_shortage:.4f} ETH"
                 )
                 try:
                     await self.hibachi.close_position(
@@ -752,7 +752,7 @@ class DeltaNeutralBot:
             if hb_actual_closed <= 0.001:
                 logger.error("청산 청크 %d: Hibachi 0 청산", chunk_idx + 1)
                 await self.telegram.send_alert(
-                    f"⚠️ 청산 청크 {chunk_idx + 1} Hibachi 0 → 다음 청크 진행"
+                    f"<b>[⚠️ CHUNK {chunk_idx + 1}]</b> 청산 Hibachi 0 → 다음 청크 진행"
                 )
                 continue
 
@@ -820,7 +820,7 @@ class DeltaNeutralBot:
                     chunk_idx + 1, sx_max_attempts, Config.EMERGENCY_CLOSE_SLIPPAGE_PCT * 100,
                 )
                 await self.telegram.send_alert(
-                    f"🚨 청크 {chunk_idx + 1} SX 응급 시장가 시도 "
+                    f"<b>[🚨 CHUNK {chunk_idx + 1}]</b> SX 응급 시장가 시도 "
                     f"(slippage {Config.EMERGENCY_CLOSE_SLIPPAGE_PCT * 100:.1f}%)"
                 )
                 try:
@@ -848,9 +848,9 @@ class DeltaNeutralBot:
                     chunk_idx + 1, hb_actual_closed,
                 )
                 await self.telegram.send_alert(
-                    f"🚨🚨 청산 청크 {chunk_idx + 1} hb {hb_actual_closed:.4f} 청산 → "
-                    f"StandX 응급 시장가({Config.EMERGENCY_CLOSE_SLIPPAGE_PCT * 100:.1f}%)도 실패! "
-                    f"편측 노출. 수동 개입 필요."
+                    f"<b>[🚨 EMERGENCY]</b> 청산 청크 {chunk_idx + 1} hb {hb_actual_closed:.4f} → "
+                    f"SX 응급 시장가({Config.EMERGENCY_CLOSE_SLIPPAGE_PCT * 100:.1f}%)도 실패. "
+                    f"편측 노출. 수동 개입 필요합니다"
                 )
                 break
 
@@ -872,7 +872,7 @@ class DeltaNeutralBot:
                 sx_still_size, hb_still_size,
             )
             await self.telegram.send_alert(
-                "⚠️ 청산 후 거래소 API 응답 불가 → 메모리 보존, EXIT 재시도."
+                "<b>[⚠️ WARNING]</b> 청산 후 거래소 API 응답 불가 → 메모리 보존, EXIT 재시도"
             )
             return False
 
@@ -890,7 +890,7 @@ class DeltaNeutralBot:
             )
             return False
 
-        await self.telegram.send_alert(f"✅ XEMM 분할 청산 완료 ({closed_chunks}청크)")
+        await self.telegram.send_alert(f"<b>[✅ XEMM EXIT]</b> 분할 청산 완료 ({closed_chunks}청크)")
         return True
 
     def _log_cycle(self, cycle: Cycle):
@@ -971,10 +971,10 @@ class DeltaNeutralBot:
             self.state.cumulative_funding, self.state.cumulative_fees, 0.0
         )
         text = (
-            f"📊 <b>일일 리포트</b> ({now_kst.strftime('%Y-%m-%d')})\n"
+            f"📊 <b>Daily Report</b> ({now_kst.strftime('%Y-%m-%d')})\n"
+            f"━━━━━━━━━━━━━━━\n"
             f"상태: {self.state.cycle_state}\n"
-            f"StandX: ${self.state.standx_balance:,.2f}\n"
-            f"Hibachi: ${self.state.hibachi_balance:,.2f}\n"
+            f"SX: ${self.state.standx_balance:,.2f} / HB: ${self.state.hibachi_balance:,.2f}\n"
             f"누적 펀딩수익: ${self.state.cumulative_funding:,.2f}\n"
             f"SIP-2 추정: ${sip2:,.2f}\n"
             f"주간 거래량: ${self.state.weekly_hibachi_volume:,.0f} / $100,000"
@@ -994,7 +994,7 @@ class DeltaNeutralBot:
                 if depeg > 0.01:
                     self._last_warning_time = time.time()
                     await self.telegram.send_alert(
-                        f"⚠️ DUSD 디페그 경고: {depeg:.2%}\n"
+                        f"<b>[⚠️ DUSD DEPEG]</b> {depeg:.2%}\n"
                         f"Mark: ${mark_price:,.2f} / Index: ${index_price:,.2f}"
                     )
         except Exception:
@@ -1091,13 +1091,12 @@ class DeltaNeutralBot:
                     self.state.weekly_hibachi_volume += notional
                     fee = notional * Config.FEE_PER_FILL
                     self.state.cumulative_fees += fee
+                    sx_side = "SHORT" if "standx_short" in direction else "LONG"
+                    hb_side = "LONG" if "hibachi_long" in direction else "SHORT"
                     await self.telegram.send_alert(
-                        f"✅ 사이클 #{self.state.current_cycle_id} 진입\n"
-                        f"방향: {direction}\n"
-                        f"노셔널: ${notional:,.0f}\n"
-                        f"진입 스프레드: ${entry_spread:.2f}\n"
-                        f"StandX: ${sx_available:,.2f} @ ${sx_entry:,.2f}\n"
-                        f"Hibachi: ${hb_available:,.2f} @ ${hb_entry:,.2f}"
+                        f"✅ <b>[ENTER #{self.state.current_cycle_id}]</b> {Config.PAIR_STANDX}\n"
+                        f"SX {sx_side} / HB {hb_side} | ${notional:,.0f}\n"
+                        f"스프레드: ${entry_spread:.2f}"
                     )
                 else:
                     self.state.cycle_state = CycleState.IDLE
@@ -1105,7 +1104,7 @@ class DeltaNeutralBot:
 
             except Exception as e:
                 logger.error("분석/진입 실패: %s", e)
-                await self.telegram.send_alert(f"🚨 분석/진입 실패: {e}")
+                await self.telegram.send_alert(f"<b>[🚨 ERROR]</b> 분석/진입 실패: {e}")
                 self.state.cycle_state = CycleState.IDLE
                 self._save_state()
 
@@ -1117,7 +1116,7 @@ class DeltaNeutralBot:
             margin_level = await self._check_margin_safety()
             if margin_level == MarginLevel.EMERGENCY:
                 logger.warning("🚨 긴급 청산!")
-                await self.telegram.send_alert("🚨 마진율 위험! 양쪽 긴급 청산 실행!")
+                await self.telegram.send_alert("<b>[🚨 MARGIN EMERGENCY]</b> 양쪽 긴급 청산 실행")
                 success = await self._execute_exit()
                 if success:
                     if self._current_cycle:
@@ -1146,7 +1145,7 @@ class DeltaNeutralBot:
                     self.state.cycle_state = CycleState.COOLDOWN
                     self._cooldown_until = time.time() + Config.COOLDOWN_HOURS * 3600
                 else:
-                    await self.telegram.send_alert("🚨 긴급 청산 부분 실패! 수동 확인 필요!")
+                    await self.telegram.send_alert("<b>[🚨 EMERGENCY]</b> 긴급 청산 부분 실패. 수동 확인 필요합니다")
                 self._save_state()
                 return
 
@@ -1154,7 +1153,7 @@ class DeltaNeutralBot:
                 if time.time() - self._last_warning_time > 1800:  # 30분 쿨다운
                     self._last_warning_time = time.time()
                     worst = self._get_worst_margin()
-                    await self.telegram.send_alert(f"⚠️ 마진율 경고: {worst:.1f}%")
+                    await self.telegram.send_alert(f"<b>[⚠️ MARGIN]</b> {worst:.1f}%")
 
             worst_margin = self._get_worst_margin()
 
@@ -1186,7 +1185,7 @@ class DeltaNeutralBot:
                     if self._current_cycle:
                         self._current_cycle.exit_reason = "spread_opportunity"
                     await self.telegram.send_alert(
-                        f"💰 기회적 청산 트리거! spread MTM ${delta_sum:+,.1f}\n"
+                        f"<b>[💰 SPREAD EXIT]</b> MTM ${delta_sum:+,.1f}\n"
                         f"⚠️ paper 값 — 진입/HOLD/청산 비용 미차감\n"
                         f"실현 PnL은 청산 완료 메시지에서 확정\n"
                         f"(threshold ${Config.SPREAD_EXIT_THRESHOLD:.0f}, 보유 {hold_hours:.1f}h)"
@@ -1211,7 +1210,7 @@ class DeltaNeutralBot:
                 safety_margin = Config.PRINCIPAL_RECOVERY_SAFETY_MARGIN_USD
                 threshold = init_total + fee_buffer + safety_margin
                 await self.telegram.send_alert(
-                    f"💰 원금 회수 청산! 잔액 ${current_total:,.2f} ≥ 임계 ${threshold:,.2f}\n"
+                    f"<b>[💰 PRINCIPAL EXIT]</b> 잔액 ${current_total:,.2f} ≥ 임계 ${threshold:,.2f}\n"
                     f"(진입 ${init_total:,.2f} + 청산 fee ${fee_buffer:.2f} + spread 마진 ${safety_margin:.2f})\n"
                     f"보유 {hold_hours:.1f}h"
                 )
@@ -1238,8 +1237,8 @@ class DeltaNeutralBot:
                 self.state.cycle_state = CycleState.EXIT
                 self._save_state()
                 pair = self.state.pair or "?"
-                await self._telegram.send_alert(
-                    f"[🔔 EXIT 결정] {pair} | {exit_reason} | "
+                await self.telegram.send_alert(
+                    f"<b>[🔔 EXIT]</b> {pair} | {exit_reason} | "
                     f"보유 {hold_hours:.1f}h, 마진 {worst_margin:.1f}%"
                 )
 
@@ -1258,8 +1257,8 @@ class DeltaNeutralBot:
                     )
                     self.state.cycle_state = CycleState.MANUAL_INTERVENTION
                     await self.telegram.send_alert(
-                        f"⛔ EXIT {self.state.exit_failure_count}회 연속 실패 → 봇 자동 청산 중단.\n"
-                        f"수동으로 양쪽 거래소 포지션 정리 후 봇 재시작 필요.\n"
+                        f"<b>[⛔ MANUAL]</b> EXIT {self.state.exit_failure_count}회 연속 실패 → 봇 자동 청산 중단\n"
+                        f"수동으로 양쪽 거래소 포지션 정리 후 봇 재시작 필요합니다\n"
                         f"(재시작 시 _recovery_check가 새 상태 결정)"
                     )
                 else:
@@ -1343,14 +1342,13 @@ class DeltaNeutralBot:
                     "margin_emergency": "🚨 마진긴급",
                     "direction_switch": "🔄 방향전환",
                 }.get(self._current_cycle.exit_reason, "🔄")
+                pnl_total = (self._current_cycle.standx_balance_after + self._current_cycle.hibachi_balance_after) - (self._current_cycle.balance_t0_total or 0)
+                pnl_emoji = "🟢" if pnl_total >= 0 else "🔴"
                 await self.telegram.send_alert(
-                    f"{reason_label} 사이클 #{self._current_cycle.cycle_id} 청산\n"
-                    f"보유: {hold_h:.1f}시간\n"
-                    f"진입 스프레드: ${self._current_cycle.entry_spread:.2f}\n"
-                    f"청산 스프레드: ${exit_spread:.2f}\n"
-                    f"스프레드 비용: ${self._current_cycle.spread_cost:.2f}\n"
-                    f"StandX: ${self._current_cycle.standx_balance_after:,.2f}\n"
-                    f"Hibachi: ${self._current_cycle.hibachi_balance_after:,.2f}"
+                    f"{pnl_emoji} <b>[EXIT #{self._current_cycle.cycle_id}]</b> {reason_label}\n"
+                    f"보유: {hold_h:.1f}h | 스프레드 비용: ${self._current_cycle.spread_cost:.2f}\n"
+                    f"SX: ${self._current_cycle.standx_balance_after:,.2f} / "
+                    f"HB: ${self._current_cycle.hibachi_balance_after:,.2f}"
                 )
                 self._current_cycle = None
 
@@ -1382,8 +1380,8 @@ class DeltaNeutralBot:
                 if time.time() - self._last_warning_time > 1800:
                     self._last_warning_time = time.time()
                     await self.telegram.send_alert(
-                        "⛔ MANUAL_INTERVENTION + 거래소 API 응답 불가.\n"
-                        "잔량 확인 불가 — 거래소에서 직접 양쪽 잔량 확인 부탁드리오."
+                        "<b>[⛔ MANUAL]</b> 거래소 API 응답 불가\n"
+                        "잔량 확인 불가 — 거래소에서 직접 양쪽 잔량 확인 부탁드립니다"
                     )
                 return
 
@@ -1403,7 +1401,7 @@ class DeltaNeutralBot:
                 self.state.cycle_state = CycleState.IDLE
                 self._save_state()
                 await self.telegram.send_alert(
-                    "✅ 수동 청산 감지 → IDLE 복귀. 다음 분석 사이클부터 자동 거래 재개."
+                    "<b>[✅ MANUAL]</b> 수동 청산 감지 → IDLE 복귀. 다음 분석 사이클부터 자동 거래 재개합니다"
                 )
                 return
 
@@ -1411,9 +1409,9 @@ class DeltaNeutralBot:
             if time.time() - self._last_warning_time > 1800:
                 self._last_warning_time = time.time()
                 await self.telegram.send_alert(
-                    f"⛔ 봇 정지 중 (MANUAL_INTERVENTION).\n"
+                    f"<b>[⛔ MANUAL]</b> 봇 정지 중\n"
                     f"잔여: SX {sx_size:.3f} / HB {hb_size:.6f}\n"
-                    f"양쪽 포지션 모두 청산하시면 자동으로 IDLE 복귀하오."
+                    f"양쪽 포지션 모두 청산하시면 자동으로 IDLE 복귀합니다"
                 )
 
     async def _recovery_check(self):
@@ -1482,9 +1480,8 @@ class DeltaNeutralBot:
             )
 
             await self.telegram.send_alert(
-                f"🔁 봇 재시작: 포지션 복구 완료\n"
-                f"StandX: {sx_side} ${notional:,.0f}\n"
-                f"Hibachi: {hb_side} ${notional:,.0f}\n"
+                f"<b>[🔁 RECOVERY]</b> 포지션 복구 완료\n"
+                f"SX: {sx_side} ${notional:,.0f} / HB: {hb_side} ${notional:,.0f}\n"
                 f"방향: {self.state.current_direction or '미확인'}"
             )
 
@@ -1492,7 +1489,7 @@ class DeltaNeutralBot:
             side = "StandX" if sx_pos else "Hibachi"
             logger.warning("편측 포지션 감지: %s", side)
             await self.telegram.send_alert(
-                f"⚠️ 봇 재시작: {side}에만 포지션 존재! 수동 확인 필요"
+                f"<b>[⚠️ WARNING]</b> 봇 재시작: {side}에만 포지션 존재. 수동 확인 필요합니다"
             )
         else:
             # NEW-5: ENTER/ANALYZE 상태에서 크래시 후 포지션 없음 → IDLE 복귀
@@ -1755,12 +1752,14 @@ class DeltaNeutralBot:
             # I8: 리소스 누수 수정
             with open(path) as f:
                 lines = f.readlines()[-5:]
-            text = "📋 <b>최근 사이클</b>\n\n"
+            text = "📋 <b>최근 사이클</b>\n━━━━━━━━━━━━━━━\n"
             for line in lines:
                 c = json.loads(line)
                 hold = ((c.get("exited_at", 0) or 0) - c.get("entered_at", 0)) / 3600
+                sc = c.get("spread_cost", 0)
+                emoji = "🟢" if sc <= 0 else "🔴"
                 text += (
-                    f"#{c['cycle_id']} {c['direction'][:20]}\n"
+                    f"#{c['cycle_id']} {c['direction'][:20]} {emoji}\n"
                     f"  보유: {hold:.1f}h / 노셔널: ${c['notional']:,.0f}\n\n"
                 )
             await self.telegram.send_alert(text)
@@ -1772,38 +1771,39 @@ class DeltaNeutralBot:
                 hb_rate = await self.hibachi.get_funding_rate(Config.PAIR_HIBACHI)
                 text = (
                     f"💰 <b>Funding Rates</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
                     f"StandX (1H): {sx_rate:.6f}\n"
                     f"Hibachi (8H): {hb_rate:.6f}\n"
                     f"누적 비용: {self._cumulative_funding_cost:.6f}"
                 )
             except Exception as e:
-                text = f"💰 펀딩레이트 조회 실패: {e}"
+                text = f"<b>[💰 FUNDING]</b> 조회 실패: {e}"
             await self.telegram.send_alert(text)
 
         async def on_rebalance(cb):
             if self.state.cycle_state == CycleState.HOLD:
                 self.state.cycle_state = CycleState.EXIT
                 self._save_state()
-                await self.telegram.send_alert("🔄 수동 리밸런싱 트리거됨")
+                await self.telegram.send_alert("<b>[🔄 REBALANCE]</b> 수동 EXIT 트리거")
             else:
                 await self.telegram.send_alert(
-                    f"현재 상태({self.state.cycle_state})에서는 리밸런싱 불가"
+                    f"<b>[⚠️ WARNING]</b> 현재 상태({self.state.cycle_state})에서는 리밸런싱 불가합니다"
                 )
 
         async def on_force_exit(cb):
             """🔚 Close Now — 현재 사이클 즉시 청산 + 쿨다운 스킵 → 즉시 다음 사이클 진입"""
             if self.state.cycle_state != CycleState.HOLD:
                 await self.telegram.send_alert(
-                    f"현재 상태({self.state.cycle_state.value})에서는 강제 청산 불가\n"
-                    f"HOLD 상태에서만 가능"
+                    f"<b>[⚠️ WARNING]</b> 현재 상태({self.state.cycle_state.value})에서는 강제 청산 불가합니다\n"
+                    f"HOLD 상태에서만 가능합니다"
                 )
                 return
             if not self._positions:
-                await self.telegram.send_alert("청산할 포지션 없음")
+                await self.telegram.send_alert("<b>[⚠️ WARNING]</b> 청산할 포지션 없습니다")
                 return
 
             await self.telegram.send_alert(
-                f"🔚 강제 청산 시작 (사이클 #{self.state.current_cycle_id}, XEMM)"
+                f"<b>[🔚 CLOSE NOW]</b> 사이클 #{self.state.current_cycle_id} 강제 청산 시작"
             )
 
             if self._current_cycle:
@@ -1815,7 +1815,7 @@ class DeltaNeutralBot:
             success = await self._execute_exit()
 
             if not success:
-                await self.telegram.send_alert("🚨 강제 청산 부분 실패. 수동 확인 필요!")
+                await self.telegram.send_alert("<b>[🚨 EMERGENCY]</b> 강제 청산 부분 실패. 수동 확인 필요합니다")
                 return
 
             if self._current_cycle:
@@ -1829,12 +1829,12 @@ class DeltaNeutralBot:
             self._save_state()
 
             await self.telegram.send_alert(
-                f"✅ 사이클 #{self.state.current_cycle_id} 강제 청산 완료\n"
-                f"🚀 쿨다운 스킵 → 다음 틱(5초)에 사이클 #{self.state.current_cycle_id + 1} 진입 시도"
+                f"<b>[✅ CLOSE NOW]</b> 사이클 #{self.state.current_cycle_id} 강제 청산 완료\n"
+                f"쿨다운 스킵 → 다음 틱에 사이클 #{self.state.current_cycle_id + 1} 진입 시도"
             )
 
         async def on_stop(cb):
-            await self.telegram.send_alert("⏹ 봇 종료 중... 포지션 청산")
+            await self.telegram.send_alert("<b>[⏹ STOP]</b> 포지션 청산 후 봇 종료합니다")
             self._running = False  # C7: 먼저 플래그 설정
             if self._positions:
                 if self._current_cycle:
@@ -1847,31 +1847,40 @@ class DeltaNeutralBot:
                     self._log_cycle(self._current_cycle)
                     self._current_cycle = None
                 if not success:
-                    await self.telegram.send_alert("🚨 Stop 청산 부분 실패! 수동 확인 필요!")
+                    await self.telegram.send_alert("<b>[🚨 EMERGENCY]</b> Stop 청산 부분 실패. 수동 확인 필요합니다")
             self._save_state()
             # Watchdog 영구 정지 (재시작 방지)
             stop_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stop_bot")
             with open(stop_file, "w") as f:
                 f.write(str(time.time()))
 
+        async def on_kill(cb):
+            self._running = False
+            self._save_state()
+            await self.telegram.send_alert("<b>[💀 KILL]</b> 포지션 유지, 봇만 즉시 종료합니다")
+            stop_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stop_bot")
+            with open(stop_file, "w") as f:
+                f.write(str(time.time()))
+
         from telegram_ui import (
-            BTN_STATUS, BTN_DETAIL, BTN_HISTORY,
-            BTN_FUNDING, BTN_REBALANCE, BTN_FORCE_EXIT, BTN_STOP,
+            BTN_STATUS, BTN_POSITIONS, BTN_HISTORY,
+            BTN_FUNDING, BTN_FORCE_EXIT, BTN_STOP, BTN_KILL,
         )
         self.telegram.register_callback(BTN_STATUS, on_status)
-        self.telegram.register_callback(BTN_DETAIL, on_detail)
+        self.telegram.register_callback(BTN_POSITIONS, on_detail)
         self.telegram.register_callback(BTN_HISTORY, on_history)
         self.telegram.register_callback(BTN_FUNDING, on_funding)
-        self.telegram.register_callback(BTN_REBALANCE, on_rebalance)
         self.telegram.register_callback(BTN_FORCE_EXIT, on_force_exit)
         self.telegram.register_callback(BTN_STOP, on_stop)
+        self.telegram.register_callback(BTN_KILL, on_kill)
 
     async def run(self):
         self._running = True
         self._register_telegram_callbacks()
 
+        await self.telegram.flush_pending_updates()
         await self.telegram.send_main_menu(
-            f"🚀 Delta Neutral Bot 시작\n상태: {self.state.cycle_state}"
+            f"<b>[🚀 START]</b> Delta Neutral Bot 시작\n상태: {self.state.cycle_state}"
         )
 
         # RM-3: 시작 시 레버리지 설정
@@ -1956,15 +1965,15 @@ class DeltaNeutralBot:
                                 )
                                 self.state.cycle_state = CycleState.MANUAL_INTERVENTION
                                 await self.telegram.send_alert(
-                                    f"⛔ API {self._consecutive_api_failures}회 연속 실패 + 거래소 응답 불가.\n"
-                                    f"자동 청산 보류 (거짓 데이터로 더 큰 사고 위험) → MANUAL_INTERVENTION.\n"
-                                    f"API 회복 후 자동 재개. 거래소에서 양쪽 포지션 직접 확인 권장."
+                                    f"<b>[⛔ MANUAL]</b> API {self._consecutive_api_failures}회 연속 실패 + 거래소 응답 불가\n"
+                                    f"자동 청산 보류 (거짓 데이터 위험) → MANUAL_INTERVENTION\n"
+                                    f"API 회복 후 자동 재개. 거래소에서 양쪽 포지션 직접 확인 권장합니다"
                                 )
                                 self._save_state()
                                 continue
                             await self.telegram.send_alert(
-                                f"🚨 API {self._consecutive_api_failures}회 연속 실패! "
-                                f"포지션 감시 불가 — 긴급 청산 실행!"
+                                f"<b>[🚨 EMERGENCY EXIT]</b> API {self._consecutive_api_failures}회 연속 실패! "
+                                f"포지션 감시 불가 — 긴급 청산 실행"
                             )
                             exit_ok = await self._execute_exit()
                             # RC-4: 긴급 청산 후 Cycle 기록 + 상태 정리
@@ -1985,7 +1994,7 @@ class DeltaNeutralBot:
                             else:
                                 # 부분 실패 시 EXIT 상태로 재시도 유도
                                 self.state.cycle_state = CycleState.EXIT
-                                await self.telegram.send_alert("🚨 긴급 청산 부분 실패! EXIT 상태에서 재시도합니다")
+                                await self.telegram.send_alert("<b>[🚨 EMERGENCY]</b> 긴급 청산 부분 실패. EXIT 상태에서 재시도합니다")
                             self._save_state()
 
                 # 펀딩레이트 체크 (1시간) + I1: 누적 비용 갱신
@@ -2027,7 +2036,7 @@ class DeltaNeutralBot:
                                     logger.info("S5: 반대 방향 유리 → EXIT 트리거")
                                     if self._current_cycle:
                                         self._current_cycle.exit_reason = "direction_switch"
-                                    await self.telegram.send_alert("🔄 반대 방향이 유리해짐 → 전환 준비")
+                                    await self.telegram.send_alert("<b>[🔄 DIRECTION]</b> 반대 방향이 유리해짐 → 전환 준비")
                                     self.state.cycle_state = CycleState.EXIT
                                     self._save_state()
 
